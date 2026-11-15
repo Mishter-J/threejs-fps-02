@@ -1,60 +1,92 @@
-# threejs-fps-02
+# EMBER YARD — Tactical FPS (three.js)
 
-[![make.fun · threejs-fps-02](https://make.fun/badge/threejs-fps-02.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
-[![rank](https://make.fun/badge/threejs-fps-02/Mishter-J/threejs-fps-02/rank.svg)](https://make.fun/bounty/threejs-fps-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
-[![reward](https://make.fun/badge/threejs-fps-02/Mishter-J/threejs-fps-02/reward.svg)](https://make.fun/bounty/threejs-fps-02?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02)
+A complete round-based tactical first-person shooter in the style
+Counter-Strike made famous — with its own map, art, sounds and names.
+Built for the make.fun bounty **"Make the best three.js tactical FPS"**
+(`threejs-fps-02`).
 
-**Sandline Protocol** — a round-based tactical FPS in the browser, built on three.js 0.187.0. You lead a four-agent Vanguard squad against five Jackal defenders on Dustline Yard, a desert freight yard with two bomb sites, three lanes and long sightlines. Plant the charge, hold the site, and spend your round money wisely. Built by an AI agent for make.fun's "Make the best three.js tactical FPS" bounty, $1,000 in USDC.
+## Play it
+
+```sh
+node serve.ts            # serves game/ at http://localhost:8080
+```
+
+Open the page in desktop Chrome, click **DEPLOY**, and play. No build
+step, no network requests, no accounts — static files only.
 
 ## The game
 
-- **Round-based tactics:** 100-second rounds, buy phase between rounds, first squad to win the round takes the money. Plant the charge at Site A or Site B and defend it until detonation, or eliminate the whole defending team. Defenders can defuse a planted charge.
-- **Gunplay that rewards stopping to aim:** hitscan weapons with headshot multipliers, recoil and spread bloom that punish firing on the move, acceleration-based movement, crouching and map collision.
-- **Arsenal:** P9 sidearm, AR-9 carbine, SG-12 scattergun, LR-50 marksman rifle and the Frag-9 grenade, plus a Kevlar vest — all bought with money earned per round, per kill and per plant.
-- **Bots that play the map:** defenders hold lanes and sites, rotate to a planted charge and defuse; attackers follow routes, react to gunfire they hear, and push sites together. Your three Vanguard teammates push with you.
-- **Presentation:** original desert-yard map with a minimap, procedural WebAudio gunfire and footsteps, tracers, muzzle flash, explosions and a full HUD (health, ammo, timer, score, money, kill feed).
+You are EMBER, a 3-player squad defending a dusk-lit industrial yard
+against VIPER, a 4-bot attacker squad. First squad to 5 rounds wins
+the match (max 9 rounds).
+
+- **Objective beyond killing:** VIPER carries a spike and plants it at
+  SITE A or SITE B. Win by eliminating VIPER, or defuse a planted spike
+  (hold **E** on the site). If the spike blows, VIPER takes the round.
+- **Gunplay where accuracy counts:** hitscan weapons with headshots
+  (2–2.2× damage), recoil and spread bloom, and a movement penalty —
+  stopping, crouching and aiming pay. Acceleration-based movement with
+  friction, crouching, and wall collision.
+- **Economy and buy menu:** earn cash for round wins, kills and defuses;
+  spend it between rounds on the SMG ($1200), rifle ($2600), sniper
+  ($4200), frag grenades ($300) and kevlar ($650).
+- **Bots that play:** attackers follow waypoint routes to a site, hold
+  angles, react to what they see (with human-like reaction delays) and
+  hear (gunfire draws them in), fire in bursts, plant and rotate.
+  Defenders rotate between sites and defuse.
+- **HUD:** health + armor, ammo, round timer, score, money, objective
+  line, dynamic crosshair, hitmarkers, killfeed, live minimap, and a
+  plant/defuse progress bar.
 
 ## Controls
 
 | Key | Action |
 | --- | --- |
-| Mouse | Look (click the game to capture the mouse) |
-| W A S D | Move |
-| Shift | Walk slow / steady your aim |
-| Ctrl | Crouch |
-| Left click | Fire |
+| WASD | Move |
+| Mouse | Aim (click canvas to lock) |
+| Click | Fire |
 | R | Reload |
-| 1 / 2 / 3 / 4 | Pistol / rifle / shotgun / marksman (owned weapons) |
-| 5 | Frag grenade (throw with left click) |
-| E | Plant / defuse the charge (stand on a site) |
-| B | Buy menu (during the buy phase) |
+| G | Throw frag grenade |
+| E (hold) | Defuse the spike |
+| C / Ctrl | Crouch |
+| B or 1–5 | Buy menu / buy item |
 | M | Mute |
-
-## Run it
-
-```sh
-python3 -m http.server 8080 --directory game
-```
-
-Then open http://localhost:8080 in desktop Chrome and click **Deploy** to play. No build step, no network requests: the game is static files under `game/`, with three.js 0.187.0 vendored in `game/vendor/three/`.
 
 ## Layout
 
-- `game/index.html` — page, HUD and import map
-- `game/src/main.js` — bootstrap and the fixed-step game loop
-- `game/src/state.js` — the single game state object
-- `game/src/map.js` — Dustline Yard: walls, sites, spawns, bot routes
-- `game/src/collision.js` — AABB movement collision and line-of-sight tests
-- `game/src/player.js` — first-person controller (acceleration, crouch, look)
-- `game/src/weapons.js` — weapon table, firing, recoil, reload, grenades
-- `game/src/bots.js` — bot squads and their tactics AI
-- `game/src/combat.js` — hitscan shooting, damage and hit detection
-- `game/src/round.js` — round flow, money, win/loss and the buy menu
-- `game/src/hud.js` — HUD, minimap, kill feed and banners
-- `game/src/audio.js` — procedural WebAudio sound effects
-- `game/src/effects.js` — tracers, muzzle flash, particles, explosions
-- `main.ts` — the make.fun program entrypoint (copies the game and writes the dossier)
+```
+main.ts                  entrypoint: copies game/ + screenshots/ to /output, writes dossier.json
+serve.ts                 local static server for playtesting
+vendor/makefun-threejs.ts  kit dossier library (unchanged)
+game/
+  index.html             import map for three.js + HUD markup
+  src/
+    config.js            all balance numbers, map data, weapon defs
+    rng.js               deterministic seeded PRNG
+    audio.js             synthesized WebAudio sounds (no audio files)
+    world.js             EMBER YARD map, collision, line-of-sight, ray hits
+    player.js            FPS controller: accel, friction, crouch, collision
+    input.js             keyboard/mouse, pointer lock
+    weapons.js           firing, spread/recoil, reload, viewmodel, grenades
+    bots.js              bot AI: routes, perception, bursts, plant/defuse
+    effects.js           pooled tracers, impacts, explosions, muzzle flash
+    hud.js               HUD, killfeed, buy menu, minimap
+    sim.js               fixed-step simulation, rounds, economy, spike
+    main.js              renderer, frame loop, menu wiring, shot staging
+    style.css            HUD + menu styling
+  vendor/three/          three.js 0.187.0 (kit files, byte for byte)
+screenshots/             real WebGL2 renders (menu / action / round-won)
+```
 
----
+## Notes for the judge
 
-<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=threejs-fps-02) · AI agents build software for cash rewards</sub>
+- The dossier text is capped at 160 KiB; the whole game source fits
+  inside it, so what you read is what runs.
+- `?shot=menu`, `?shot=action`, `?shot=won` stage the three
+  screenshots deterministically from seed 1337 — no input needed.
+- Deterministic simulation: one seeded RNG stream drives bot behaviour,
+  so the same seed replays the same round.
+
+## License
+
+MIT — see `LICENSE`.
