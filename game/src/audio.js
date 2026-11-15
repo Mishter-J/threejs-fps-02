@@ -1,136 +1,143 @@
-// audio.js — procedural WebAudio sound effects.
-//
-// No audio assets ship with the game: every sound is synthesized from
-// oscillators and filtered noise, so the game loads nothing over the
-// network and the sounds are the game's own.
+// audio.js — every sound is synthesized with WebAudio, so the game
+// ships zero audio files and makes zero network requests. All nodes
+// are created lazily on the first user gesture; muted state persists
+// in a plain boolean the HUD toggles.
 
-let ctx = null;
-let master = null;
-let muted = false;
-let noiseBuf = null;
+export function createAudio() {
+  let ctx = null;
+  let master = null;
+  let muted = false;
+  let noiseBuf = null;
 
-export function initAudio() {
-  if (ctx) return;
-  try {
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-    master = ctx.createGain();
-    master.gain.value = 0.5;
-    master.connect(ctx.destination);
-    // One shared white-noise buffer for shots, steps and explosions.
-    const len = ctx.sampleRate;
-    noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
-    const data = noiseBuf.getChannelData(0);
-    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
-  } catch {
-    ctx = null;
+  function ensure() {
+    if (ctx) {
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      return ctx;
+    }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = 0.35;
+      master.connect(ctx.destination);
+      const len = Math.floor(ctx.sampleRate * 0.5);
+      noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const data = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    } catch (e) {
+      ctx = null;
+    }
+    return ctx;
   }
+
+  function noise(dur, filterFreq, gain, type) {
+    if (!ensure() || muted || !ctx) return;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = noiseBuf;
+    src.loop = true;
+    const filt = ctx.createBiquadFilter();
+    filt.type = type || 'lowpass';
+    filt.frequency.value = filterFreq;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(filt);
+    filt.connect(g);
+    g.connect(master);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+  }
+
+  function tone(freq, dur, gain, type, slideTo) {
+    if (!ensure() || muted || !ctx) return;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = type || 'square';
+    osc.frequency.setValueAtTime(freq, t);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    osc.connect(g);
+    g.connect(master);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  return {
+    unlock() {
+      ensure();
+    },
+    setMuted(v) {
+      muted = !!v;
+      if (master) master.gain.value = muted ? 0 : 0.35;
+    },
+    isMuted() {
+      return muted;
+    },
+    shot(kind) {
+      if (kind === 'sniper') {
+        noise(0.28, 900, 0.9, 'lowpass');
+        tone(140, 0.18, 0.25, 'sawtooth', 55);
+      } else if (kind === 'smg') {
+        noise(0.09, 2400, 0.55, 'bandpass');
+      } else if (kind === 'pistol') {
+        noise(0.12, 1600, 0.7, 'bandpass');
+        tone(220, 0.08, 0.18, 'square', 90);
+      } else {
+        noise(0.14, 1200, 0.8, 'lowpass');
+        tone(180, 0.1, 0.22, 'sawtooth', 70);
+      }
+    },
+    dryFire() {
+      tone(1400, 0.03, 0.12, 'square');
+    },
+    reload() {
+      tone(500, 0.05, 0.15, 'square');
+      setTimeout(() => tone(700, 0.05, 0.15, 'square'), 180);
+    },
+    hit() {
+      tone(1900, 0.05, 0.2, 'sine');
+    },
+    headshot() {
+      tone(2400, 0.07, 0.25, 'sine');
+      setTimeout(() => tone(2900, 0.06, 0.2, 'sine'), 60);
+    },
+    kill() {
+      tone(660, 0.09, 0.2, 'triangle', 990);
+    },
+    hurt() {
+      noise(0.15, 500, 0.5, 'lowpass');
+      tone(110, 0.15, 0.25, 'sawtooth', 70);
+    },
+    step() {
+      noise(0.05, 400, 0.12, 'lowpass');
+    },
+    plantBeep() {
+      tone(1200, 0.12, 0.25, 'sine');
+    },
+    plantDone() {
+      tone(880, 0.15, 0.25, 'sine');
+      setTimeout(() => tone(1320, 0.2, 0.25, 'sine'), 140);
+    },
+    explosion() {
+      noise(0.9, 300, 1.0, 'lowpass');
+      tone(60, 0.7, 0.5, 'sine', 30);
+    },
+    roundWin() {
+      [523, 659, 784].forEach((f, i) => setTimeout(() => tone(f, 0.22, 0.22, 'triangle'), i * 130));
+    },
+    roundLose() {
+      [392, 330, 262].forEach((f, i) => setTimeout(() => tone(f, 0.25, 0.2, 'triangle'), i * 150));
+    },
+    buy() {
+      tone(990, 0.08, 0.18, 'sine');
+      setTimeout(() => tone(1480, 0.1, 0.18, 'sine'), 80);
+    },
+    click() {
+      tone(800, 0.04, 0.12, 'square');
+    },
+  };
 }
-
-export function resumeAudio() {
-  if (ctx && ctx.state === 'suspended') void ctx.resume();
-}
-
-export function setMuted(m) {
-  muted = m;
-  if (master) master.gain.value = m ? 0 : 0.5;
-}
-
-function noise(dur, filterType, freq, gain, when = 0) {
-  if (!ctx || muted) return;
-  const t = ctx.currentTime + when;
-  const src = ctx.createBufferSource();
-  src.buffer = noiseBuf;
-  src.loop = true;
-  const f = ctx.createBiquadFilter();
-  f.type = filterType;
-  f.frequency.value = freq;
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(gain, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  src.connect(f);
-  f.connect(g);
-  g.connect(master);
-  src.start(t);
-  src.stop(t + dur + 0.02);
-}
-
-function tone(freq, dur, type, gain, slideTo = null, when = 0) {
-  if (!ctx || muted) return;
-  const t = ctx.currentTime + when;
-  const o = ctx.createOscillator();
-  o.type = type;
-  o.frequency.setValueAtTime(freq, t);
-  if (slideTo !== null) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
-  const g = ctx.createGain();
-  g.gain.setValueAtTime(gain, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  o.connect(g);
-  g.connect(master);
-  o.start(t);
-  o.stop(t + dur + 0.02);
-}
-
-/** Gunshot: a sharp noise crack plus a low thump. `big` for shotgun/marksman. */
-export function playShot(kind) {
-  if (kind === 'shotgun') { noise(0.22, 'lowpass', 900, 0.9); tone(90, 0.18, 'sine', 0.7, 45); }
-  else if (kind === 'marksman') { noise(0.3, 'bandpass', 1400, 0.9); tone(70, 0.25, 'sine', 0.8, 40); }
-  else if (kind === 'pistol') { noise(0.1, 'bandpass', 1800, 0.55); tone(140, 0.08, 'sine', 0.4, 70); }
-  else { noise(0.12, 'bandpass', 2200, 0.6); tone(120, 0.09, 'sine', 0.45, 60); }
-}
-
-/** A distant, muffled shot (another bot firing). */
-export function playDistantShot() {
-  noise(0.14, 'lowpass', 500, 0.25);
-}
-
-export function playDryFire() { tone(1200, 0.04, 'square', 0.12); }
-
-export function playReload() {
-  tone(500, 0.05, 'square', 0.15);
-  tone(350, 0.05, 'square', 0.15, null, 0.18);
-  tone(700, 0.06, 'square', 0.18, null, 0.45);
-}
-
-export function playStep(run) {
-  noise(0.05, 'lowpass', 300, run ? 0.12 : 0.07);
-}
-
-export function playHitmarker(head) {
-  tone(head ? 2400 : 1800, 0.06, 'sine', 0.3);
-}
-
-export function playHurt() {
-  tone(220, 0.15, 'sawtooth', 0.25, 110);
-}
-
-export function playExplosion() {
-  noise(0.9, 'lowpass', 400, 1.0);
-  tone(60, 0.8, 'sine', 0.9, 28);
-  noise(0.4, 'bandpass', 3000, 0.4);
-}
-
-export function playBeep(final) {
-  tone(final ? 1400 : 950, 0.09, 'square', 0.22);
-}
-
-export function playPlant() {
-  tone(880, 0.07, 'square', 0.2);
-  tone(880, 0.07, 'square', 0.2, null, 0.12);
-}
-
-export function playGrenadePin() { tone(1500, 0.05, 'square', 0.15); }
-
-export function playRoundWin() {
-  for (const [f, t] of [[523, 0], [659, 0.12], [784, 0.24]]) tone(f, 0.22, 'triangle', 0.3, null, t);
-}
-
-export function playRoundLose() {
-  for (const [f, t] of [[392, 0], [330, 0.15], [262, 0.3]]) tone(f, 0.25, 'triangle', 0.3, null, t);
-}
-
-export function playBuy() {
-  tone(660, 0.06, 'square', 0.2);
-  tone(990, 0.09, 'square', 0.2, null, 0.07);
-}
-
-export function playDenied() { tone(180, 0.12, 'square', 0.25, 140); }

@@ -1,47 +1,60 @@
-// hud.js — the DOM HUD: health, ammo, timer, score, money, kill feed,
-// crosshair, minimap, buy menu and announcements.
-//
-// The HUD reads state and writes the DOM; it never writes game state
-// except through the buy callback main.js provides. Text is only
-// rewritten when it changes, so the HUD costs nothing most frames.
+// hud.js — every DOM update for the game. The markup lives in
+// index.html; this module owns the cached element handles, the
+// change-only writes (no layout thrash), the killfeed, the buy menu
+// and the 2D minimap. No game logic lives here.
 
-import { WEAPONS, BUY_CATALOG } from './weapons.js';
-import { WALLS, SITES } from './map.js';
-import { BOMB_TIMER } from './state.js';
+import { WEAPONS, GRENADE, ARMOR_PRICE, MAP } from './config.js';
 
-const $ = (id) => document.getElementById(id);
+const BUY_ITEMS = [
+  { key: '1', id: 'smg', label: 'SWARM-7 SMG', price: WEAPONS.smg.price },
+  { key: '2', id: 'rifle', label: 'VK-9 RIFLE', price: WEAPONS.rifle.price },
+  { key: '3', id: 'sniper', label: 'LONGSHOT-50', price: WEAPONS.sniper.price },
+  { key: '4', id: 'grenade', label: 'FRAG GRENADE', price: GRENADE.price },
+  { key: '5', id: 'armor', label: 'KEVLAR VEST', price: ARMOR_PRICE },
+];
 
-export function createHud(onBuy) {
+export function createHud() {
+  const $ = (id) => document.getElementById(id);
   const el = {
-    healthBar: $('health-fill'), healthNum: $('health-num'), armorNum: $('armor-num'),
-    ammoMag: $('ammo-mag'), ammoRes: $('ammo-res'), weaponName: $('weapon-name'),
-    money: $('money'), timer: $('timer'), score: $('score'), round: $('round-label'),
-    crosshair: $('crosshair'), hitmarker: $('hitmarker'), feed: $('feed'),
-    banner: $('banner'), bannerSub: $('banner-sub'),
-    buyMenu: $('buy-menu'), buyItems: $('buy-items'), buyMoney: $('buy-money'), buyMsg: $('buy-msg'),
-    minimap: $('minimap'), plantBar: $('plant-bar'), plantFill: $('plant-fill'),
-    vignette: $('vignette'), bombStatus: $('bomb-status'),
-    teamAtk: $('team-atk'), teamDef: $('team-def'),
-    menu: $('menu'), menuTitle: $('menu-title'), menuSub: $('menu-sub'),
-    reloadHint: $('reload-hint'),
+    hud: $('hud'),
+    healthNum: $('health-num'),
+    healthFill: $('health-fill'),
+    armorNum: $('armor-num'),
+    ammoMag: $('ammo-mag'),
+    ammoReserve: $('ammo-reserve'),
+    weaponName: $('weapon-name'),
+    grenades: $('grenades'),
+    timer: $('timer'),
+    scoreCt: $('score-ct'),
+    scoreT: $('score-t'),
+    roundNum: $('round-num'),
+    money: $('money'),
+    objective: $('objective'),
+    crosshair: $('crosshair'),
+    hitmarker: $('hitmarker'),
+    killfeed: $('killfeed'),
+    banner: $('banner'),
+    bannerTitle: $('banner-title'),
+    bannerSub: $('banner-sub'),
+    buyMenu: $('buy-menu'),
+    buyRows: $('buy-rows'),
+    buyMoney: $('buy-money'),
+    menuScreen: $('menu-screen'),
+    endScreen: $('end-screen'),
+    endTitle: $('end-title'),
+    endSub: $('end-sub'),
+    pauseScreen: $('pause-screen'),
+    minimap: $('minimap'),
+    vignette: $('damage-vignette'),
+    progressWrap: $('progress-wrap'),
+    progressFill: $('progress-fill'),
+    progressLabel: $('progress-label'),
+    hint: $('hint'),
   };
   const mm = el.minimap.getContext('2d');
   const cache = {};
-  let hitAt = -10;
-  let bannerUntil = 0;
-  let vignetteUntil = 0;
-
-  // Build the buy menu once from the catalog.
-  for (const item of BUY_CATALOG) {
-    const row = document.createElement('div');
-    row.className = 'buy-row';
-    row.innerHTML = `<span class="buy-name">${item.name}</span><span class="buy-desc">${item.desc}</span><span class="buy-price">$${item.price}</span>`;
-    row.addEventListener('click', () => {
-      const r = onBuy(item.id);
-      el.buyMsg.textContent = r.msg;
-    });
-    el.buyItems.appendChild(row);
-  }
+  let bannerTimer = 0;
+  let hitTimer = 0;
 
   function setText(node, key, value) {
     if (cache[key] !== value) {
@@ -50,182 +63,214 @@ export function createHud(onBuy) {
     }
   }
 
-  function drawMinimap(state, now) {
-    const w = el.minimap.width;
-    const h = el.minimap.height;
-    const sx = w / 46;
-    const sz = h / 38;
-    const X = (x) => (x + 23) * sx;
-    const Z = (z) => (z + 19) * sz;
-    mm.clearRect(0, 0, w, h);
-    mm.fillStyle = 'rgba(20, 16, 10, 0.72)';
-    mm.fillRect(0, 0, w, h);
+  function drawMinimap(state) {
+    const W = 168;
+    const H = 138;
+    const sx = W / (MAP.halfW * 2 + 4);
+    const sz = H / (MAP.halfD * 2 + 4);
+    const toX = (x) => (x + MAP.halfW + 2) * sx;
+    const toY = (z) => (z + MAP.halfD + 2) * sz;
+    mm.clearRect(0, 0, W, H);
+    mm.fillStyle = 'rgba(12, 12, 18, 0.82)';
+    mm.fillRect(0, 0, W, H);
+    mm.fillStyle = '#3a3340';
+    mm.fillRect(toX(-MAP.halfW), toY(-MAP.halfD), MAP.halfW * 2 * sx, MAP.halfD * 2 * sz);
     // Walls.
-    mm.fillStyle = '#c9b285';
-    for (const b of WALLS) {
-      mm.fillRect(X(b.minX), Z(b.minZ), (b.maxX - b.minX) * sx, (b.maxZ - b.minZ) * sz);
+    mm.fillStyle = '#8a6a55';
+    for (const w of [...MAP.walls, ...MAP.crates]) {
+      mm.fillRect(toX(w.x - w.w / 2), toY(w.z - w.d / 2), w.w * sx, w.d * sz);
     }
     // Sites.
-    for (const s of SITES) {
-      mm.strokeStyle = s.id === 'A' ? '#ff6b5e' : '#5ec8e6';
-      mm.lineWidth = 1.5;
+    for (const key of ['A', 'B']) {
+      const s = MAP.sites[key];
+      mm.strokeStyle = key === 'A' ? '#3f7d6b' : '#9c3d2e';
+      mm.lineWidth = 2;
       mm.beginPath();
-      mm.arc(X(s.x), Z(s.z), s.r * sx, 0, Math.PI * 2);
+      mm.arc(toX(s.x), toY(s.z), s.r * sx, 0, Math.PI * 2);
       mm.stroke();
-      mm.fillStyle = mm.strokeStyle;
-      mm.font = 'bold 11px system-ui, sans-serif';
-      mm.textAlign = 'center';
-      mm.textBaseline = 'middle';
-      mm.fillText(s.id, X(s.x), Z(s.z));
+      mm.fillStyle = '#fff';
+      mm.font = 'bold 11px monospace';
+      mm.fillText(key, toX(s.x) - 3, toY(s.z) + 4);
     }
-    // Planted charge.
-    if (state.bomb.state === 'planted') {
-      mm.fillStyle = '#ffcf3d';
+    // Spike.
+    if (state.planted) {
+      const s = MAP.sites[state.plantedSite];
+      mm.fillStyle = '#ffb347';
       mm.beginPath();
-      mm.arc(X(state.bomb.x), Z(state.bomb.z), 4, 0, Math.PI * 2);
+      mm.arc(toX(s.x), toY(s.z), 4, 0, Math.PI * 2);
       mm.fill();
     }
-    // Allies (blue) and the player (white arrow).
+    // Bots: enemies only when recently seen or firing.
     for (const b of state.bots) {
       if (!b.alive) continue;
-      if (b.team === 'atk') {
-        mm.fillStyle = '#6db3ff';
+      const seen = state.time - (b.lastSeenByPlayerAt || -99) < 3;
+      if (b.team === 'ct') {
+        mm.fillStyle = '#5ec8a0';
         mm.beginPath();
-        mm.arc(X(b.x), Z(b.z), 3, 0, Math.PI * 2);
+        mm.arc(toX(b.pos.x), toY(b.pos.z), 3.5, 0, Math.PI * 2);
         mm.fill();
-      } else if (now - b.lastSeenAt < 3) {
-        // Enemies show only briefly after someone on your team sees them.
-        mm.fillStyle = '#ff5a4a';
+      } else if (seen) {
+        mm.fillStyle = '#ff5a3c';
         mm.beginPath();
-        mm.arc(X(b.x), Z(b.z), 3, 0, Math.PI * 2);
+        mm.arc(toX(b.pos.x), toY(b.pos.z), 3.5, 0, Math.PI * 2);
         mm.fill();
       }
     }
+    // Player arrow.
     const p = state.player;
-    if (p.alive) {
-      mm.save();
-      mm.translate(X(p.x), Z(p.z));
-      mm.rotate(Math.atan2(Math.sin(p.yaw), -Math.cos(p.yaw)) + Math.PI);
-      mm.fillStyle = '#ffffff';
-      mm.beginPath();
-      mm.moveTo(0, -6);
-      mm.lineTo(4.5, 5);
-      mm.lineTo(-4.5, 5);
-      mm.closePath();
-      mm.fill();
-      mm.restore();
-    }
+    const px = toX(p.pos.x);
+    const py = toY(p.pos.z);
+    mm.save();
+    mm.translate(px, py);
+    mm.rotate(Math.atan2(-Math.sin(p.yaw), -Math.cos(p.yaw)) + Math.PI / 2);
+    mm.fillStyle = '#7fb069';
+    mm.beginPath();
+    mm.moveTo(0, -7);
+    mm.lineTo(5, 5);
+    mm.lineTo(-5, 5);
+    mm.closePath();
+    mm.fill();
+    mm.restore();
   }
 
   return {
     el,
-
-    showMenu(title, sub, button) {
-      el.menu.style.display = 'flex';
-      el.menuTitle.textContent = title;
-      el.menuSub.textContent = sub;
-      $('menu-button').textContent = button;
+    showMenu() {
+      el.menuScreen.classList.remove('hidden');
+      el.endScreen.classList.add('hidden');
+      el.hud.classList.add('hidden');
     },
-    hideMenu() { el.menu.style.display = 'none'; },
-
-    announce(text, sub = '') {
-      el.banner.textContent = text;
-      el.bannerSub.textContent = sub;
-      el.banner.style.opacity = '1';
-      el.bannerSub.style.opacity = '1';
-      bannerUntil = performance.now() / 1000 + 3.2;
+    hideMenu() {
+      el.menuScreen.classList.add('hidden');
+      el.hud.classList.remove('hidden');
     },
-
+    showEnd(won, score) {
+      el.endTitle.textContent = won ? 'MATCH WON' : won === null ? 'MATCH DRAW' : 'MATCH LOST';
+      el.endTitle.style.color = won ? '#7fb069' : won === null ? '#ffb347' : '#ff5a3c';
+      el.endSub.textContent = `Final score — EMBER ${score.ct} : ${score.t} VIPER`;
+      el.endScreen.classList.remove('hidden');
+    },
+    hideEnd() {
+      el.endScreen.classList.add('hidden');
+    },
+    showPause(show) {
+      el.pauseScreen.classList.toggle('hidden', !show);
+    },
+    banner(title, sub, seconds) {
+      el.bannerTitle.textContent = title;
+      el.bannerSub.textContent = sub || '';
+      el.banner.classList.remove('hidden');
+      bannerTimer = seconds || 3;
+    },
+    hideBanner() {
+      el.banner.classList.add('hidden');
+      bannerTimer = 0;
+    },
     hitmark(head) {
-      hitAt = performance.now() / 1000;
-      el.hitmarker.className = head ? 'hit head' : 'hit';
-      el.hitmarker.style.opacity = '1';
+      el.hitmarker.classList.remove('hidden');
+      el.hitmarker.style.borderColor = head ? '#ff5a3c' : '#ffffff';
+      hitTimer = 0.12;
     },
-
-    hurt() {
-      vignetteUntil = performance.now() / 1000 + 0.5;
-      el.vignette.style.opacity = '0.55';
+    kill(killer, victim, head) {
+      const row = document.createElement('div');
+      row.className = 'kill-row';
+      row.innerHTML = '';
+      const k = document.createElement('span');
+      k.className = killer === 'YOU' ? 'kf-you' : 'kf-foe';
+      k.textContent = killer;
+      const mid = document.createElement('span');
+      mid.className = 'kf-mid';
+      mid.textContent = head ? ' \u2316 ' : ' \u2715 ';
+      const v = document.createElement('span');
+      v.className = victim === 'YOU' ? 'kf-you' : 'kf-foe';
+      v.textContent = victim;
+      row.append(k, mid, v);
+      el.killfeed.prepend(row);
+      while (el.killfeed.children.length > 5) el.killfeed.lastChild.remove();
+      setTimeout(() => row.remove(), 6000);
     },
-
-    setBuyOpen(open) {
-      el.buyMenu.style.display = open ? 'block' : 'none';
-      if (open) el.buyMsg.textContent = 'Click an item, or press its number key.';
+    renderBuy(state, onBuy) {
+      el.buyRows.innerHTML = '';
+      for (const item of BUY_ITEMS) {
+        const row = document.createElement('div');
+        row.className = 'buy-row';
+        const owned = item.id === 'grenade'
+          ? state.grenades > 0
+          : item.id === 'armor'
+            ? state.player.armor > 0
+            : state.weapon.def.id === item.id;
+        const afford = state.money >= item.price;
+        row.innerHTML = `<span class="buy-key">[${item.key}]</span> <span class="buy-name">${item.label}</span> <span class="buy-price">$${item.price}</span>`;
+        if (owned) row.classList.add('owned');
+        if (!afford && !owned) row.classList.add('poor');
+        row.addEventListener('click', () => onBuy(item.id));
+        el.buyRows.appendChild(row);
+      }
+      setText(el.buyMoney, 'buyMoney', `$${state.money}`);
+      el.buyMenu.classList.remove('hidden');
     },
-
-    update(state, now) {
+    hideBuy() {
+      el.buyMenu.classList.add('hidden');
+    },
+    setHint(text) {
+      setText(el.hint, 'hint', text);
+    },
+    update(state, dt) {
+      if (bannerTimer > 0) {
+        bannerTimer -= dt;
+        if (bannerTimer <= 0) this.hideBanner();
+      }
+      if (hitTimer > 0) {
+        hitTimer -= dt;
+        if (hitTimer <= 0) el.hitmarker.classList.add('hidden');
+      }
       const p = state.player;
-      const w = WEAPONS[p.current];
-      const owned = p.weapons[p.current];
-      // Health.
-      el.healthBar.style.width = `${Math.max(0, p.hp)}%`;
-      el.healthBar.style.background = p.hp > 50 ? '#7fc96b' : p.hp > 25 ? '#e8b23d' : '#e0523d';
-      setText(el.healthNum, 'hp', `${Math.ceil(p.hp)}`);
-      setText(el.armorNum, 'armor', p.armor > 0 ? `🛡 ${Math.ceil(p.armor)}` : '');
-      // Weapon + ammo.
-      setText(el.weaponName, 'wname', p.current === 'grenade' ? 'Frag-9 Grenade' : w.name);
-      if (p.current === 'grenade') {
-        setText(el.ammoMag, 'mag', `${p.grenades ?? 0}`);
-        setText(el.ammoRes, 'res', 'throw with LMB');
-      } else if (owned) {
-        setText(el.ammoMag, 'mag', `${owned.mag}`);
-        setText(el.ammoRes, 'res', `/ ${owned.reserve}`);
-      }
-      el.reloadHint.style.display = p.reloading > 0 ? 'block' : 'none';
-      if (p.reloading > 0) {
-        el.reloadHint.textContent = `Reloading… ${Math.ceil(p.reloading * 10) / 10}s`;
-      }
-      // Money, timer, score.
-      setText(el.money, 'money', `$${p.money}`);
-      const t = Math.max(0, Math.ceil(state.phaseTime));
-      const mm2 = Math.floor(t / 60);
-      const ss = String(t % 60).padStart(2, '0');
-      const timerText = state.phase === 'buy' ? `BUY ${mm2}:${ss}` : state.phase === 'live' ? `${mm2}:${ss}` : state.phase.toUpperCase();
-      setText(el.timer, 'timer', timerText);
-      el.timer.style.color = state.phase === 'live' && t <= 15 ? '#ff6b5e' : '';
-      setText(el.score, 'score', `${state.score.atk} — ${state.score.def}`);
-      setText(el.round, 'round', `ROUND ${state.round}`);
-      const atkAlive = (p.alive ? 1 : 0) + state.bots.filter((b) => b.team === 'atk' && b.alive).length;
-      const defAlive = state.bots.filter((b) => b.team === 'def' && b.alive).length;
-      setText(el.teamAtk, 'tatk', `Vanguard ${atkAlive}`);
-      setText(el.teamDef, 'tdef', `Jackals ${defAlive}`);
-      setText(el.buyMoney, 'bmoney', `$${p.money}`);
-      // Bomb status line.
-      let bombText = '';
-      if (state.bomb.state === 'carried') bombText = state.bomb.carrier === 'player' ? '💣 You carry the charge — hold E on a site to plant' : '💣 An ally carries the charge';
-      else if (state.bomb.state === 'planted') bombText = `💣 Charge planted at ${state.bomb.site} — ${Math.ceil(state.bomb.timer)}s`;
-      else if (state.bomb.state === 'defused') bombText = 'Charge defused';
-      else if (state.bomb.state === 'exploded') bombText = 'Charge detonated';
-      setText(el.bombStatus, 'bomb', bombText);
-      // Plant/defuse progress bar.
-      const prog = p.planting > 0 ? p.planting / 3 : state.bomb.progress;
-      if (prog > 0 && state.bomb.state !== 'planted') {
-        el.plantBar.style.display = 'block';
-        el.plantFill.style.width = `${Math.min(100, prog * 100)}%`;
-      } else if (state.bomb.state === 'planted') {
-        el.plantBar.style.display = 'block';
-        el.plantFill.style.width = `${Math.max(0, (state.bomb.timer / BOMB_TIMER) * 100)}%`;
-        el.plantFill.style.background = '#ffcf3d';
+      setText(el.healthNum, 'hp', String(Math.ceil(p.health)));
+      el.healthFill.style.width = `${Math.max(0, p.health)}%`;
+      el.healthFill.style.background = p.health > 50 ? '#7fb069' : p.health > 25 ? '#ffb347' : '#ff5a3c';
+      setText(el.armorNum, 'armor', p.armor > 0 ? `ARMOR ${Math.ceil(p.armor)}` : '');
+      const w = state.weapon;
+      setText(el.ammoMag, 'mag', w.reloading > 0 ? '--' : String(w.mag));
+      setText(el.ammoReserve, 'res', String(w.reserve));
+      setText(el.weaponName, 'wname', w.def.name);
+      setText(el.grenades, 'nades', `FRAG x${state.grenades}`);
+      const t = Math.max(0, Math.ceil(state.roundTimer));
+      setText(el.timer, 'timer', `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`);
+      setText(el.scoreCt, 'sct', String(state.score.ct));
+      setText(el.scoreT, 'st', String(state.score.t));
+      setText(el.roundNum, 'round', `ROUND ${state.round}`);
+      setText(el.money, 'money', `$${state.money}`);
+      const obj = state.phase === 'roundEnd' || state.phase === 'matchEnd'
+        ? (state.roundReason || 'ROUND OVER')
+        : state.planted
+        ? `SPIKE PLANTED ${state.plantedSite} — DEFUSE IT (${Math.ceil(state.explodeTimer)}s)`
+        : state.phase === 'buy'
+          ? 'BUY PHASE — press B or click to buy, then the round starts'
+          : state.spikeCarrierName
+            ? `STOP THE SPIKE — ${state.spikeCarrierName} carries it`
+            : 'ELIMINATE VIPER OR STOP THE SPIKE';
+      setText(el.objective, 'obj', obj);
+      // Crosshair gap grows with spread: stopping to aim pays.
+      const gap = 4 + state.spread * 900;
+      el.crosshair.style.setProperty('--gap', `${gap.toFixed(1)}px`);
+      el.crosshair.style.opacity = state.phase === 'live' && p.alive ? '1' : '0.25';
+      // Damage vignette fades.
+      const v = parseFloat(el.vignette.style.opacity || '0');
+      if (v > 0) el.vignette.style.opacity = String(Math.max(0, v - dt * 1.8));
+      // Plant / defuse progress.
+      const prog = state.playerPlant > 0 ? state.playerPlant : state.playerDefuse > 0 ? state.playerDefuse : 0;
+      const progMax = state.playerPlant > 0 ? 3 : 5;
+      if (prog > 0) {
+        el.progressWrap.classList.remove('hidden');
+        el.progressFill.style.width = `${(prog / progMax) * 100}%`;
+        setText(el.progressLabel, 'prog', state.playerPlant > 0 ? 'PLANTING…' : 'DEFUSING…');
       } else {
-        el.plantBar.style.display = 'none';
+        el.progressWrap.classList.add('hidden');
       }
-      // Crosshair spread follows bloom + movement.
-      const spread = 6 + p.bloom * 900 + Math.min(1, p.speed / 4.4) * 14;
-      el.crosshair.style.setProperty('--gap', `${spread.toFixed(1)}px`);
-      el.crosshair.style.opacity = p.alive && state.phase !== 'menu' ? '1' : '0';
-      // Hitmarker + banner + vignette fade.
-      if (now - hitAt > 0.18) el.hitmarker.style.opacity = '0';
-      if (now > bannerUntil) {
-        el.banner.style.opacity = '0';
-        el.bannerSub.style.opacity = '0';
-      }
-      if (now > vignetteUntil) el.vignette.style.opacity = '0';
-      // Kill feed.
-      const feedHtml = state.feed.slice(0, 5).map((f) => `<div class="feed-row ${f.team}">${f.text}</div>`).join('');
-      if (cache.feed !== feedHtml) {
-        cache.feed = feedHtml;
-        el.feed.innerHTML = feedHtml;
-      }
-      drawMinimap(state, now);
+      drawMinimap(state);
+    },
+    flashDamage() {
+      el.vignette.style.opacity = '0.85';
     },
   };
 }
