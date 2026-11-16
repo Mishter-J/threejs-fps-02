@@ -1,148 +1,140 @@
-// effects.js — pooled, allocation-free visual effects: tracers,
-// impact puffs, muzzle flashes and explosions. Every pool entry is
-// created once at startup and recycled; update() never allocates.
-
+// effects.js — every visual effect is preallocated and pooled: tracers,
+// impact puffs, the explosion flash and the muzzle light are created once
+// and reused, so the hot loop never calls `new` and never adds or removes
+// objects from the scene while the game runs.
 import * as THREE from 'three';
 
-const TRACER_POOL = 24;
-const PUFF_POOL = 32;
+const TRACER_COUNT = 16;
+const PUFF_COUNT = 24;
 
 export function createEffects(scene) {
+  const tracerGeo = new THREE.BoxGeometry(0.03, 0.03, 1);
   const tracers = [];
-  for (let i = 0; i < TRACER_POOL; i++) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-    const line = new THREE.Line(
-      geo,
-      new THREE.LineBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0 }),
+  for (let i = 0; i < TRACER_COUNT; i++) {
+    const m = new THREE.Mesh(
+      tracerGeo,
+      new THREE.MeshBasicMaterial({ color: 0xffe9a8, transparent: true, opacity: 0 }),
     );
-    line.frustumCulled = false;
-    scene.add(line);
-    tracers.push({ line, life: 0 });
+    m.visible = false;
+    scene.add(m);
+    tracers.push({ mesh: m, life: 0 });
   }
-  let tracerIdx = 0;
 
+  const puffGeo = new THREE.BoxGeometry(0.12, 0.12, 0.12);
   const puffs = [];
-  const puffGeo = new THREE.SphereGeometry(0.09, 6, 5);
-  for (let i = 0; i < PUFF_POOL; i++) {
-    const mesh = new THREE.Mesh(
+  for (let i = 0; i < PUFF_COUNT; i++) {
+    const m = new THREE.Mesh(
       puffGeo,
-      new THREE.MeshBasicMaterial({ color: 0xffd27a, transparent: true, opacity: 0 }),
+      new THREE.MeshBasicMaterial({ color: 0xd8c49a, transparent: true, opacity: 0 }),
     );
-    mesh.visible = false;
-    scene.add(mesh);
-    puffs.push({ mesh, life: 0, vx: 0, vy: 0, vz: 0 });
+    m.visible = false;
+    scene.add(m);
+    puffs.push({ mesh: m, life: 0, vx: 0, vy: 0, vz: 0 });
   }
-  let puffIdx = 0;
 
-  // One reusable explosion shell + light.
+  // One reusable explosion sphere and one reusable point light.
   const boom = new THREE.Mesh(
-    new THREE.SphereGeometry(1, 18, 12),
-    new THREE.MeshBasicMaterial({ color: 0xff7a2a, transparent: true, opacity: 0, depthWrite: false }),
+    new THREE.SphereGeometry(1, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0 }),
   );
   boom.visible = false;
   scene.add(boom);
-  const boomLight = new THREE.PointLight(0xff8a3d, 0, 22, 1.6);
+  const boomLight = new THREE.PointLight(0xff9a3c, 0, 30, 1.6);
   scene.add(boomLight);
+
+  // Muzzle light: a single point light that jumps to the gun and fades.
+  const muzzleLight = new THREE.PointLight(0xffd27a, 0, 12, 1.8);
+  scene.add(muzzleLight);
+
+  let tracerNext = 0;
+  let puffNext = 0;
   let boomLife = 0;
 
-  // Muzzle flash: a small additive sprite quad at the gun tip.
-  const flash = new THREE.Mesh(
-    new THREE.PlaneGeometry(0.34, 0.34),
-    new THREE.MeshBasicMaterial({
-      color: 0xffd27a, transparent: true, opacity: 0,
-      blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
-    }),
-  );
-  flash.visible = false;
-  scene.add(flash);
-  let flashLife = 0;
-
-  const tmpColor = new THREE.Color();
-
   return {
-    tracer(ax, ay, az, bx, by, bz, color) {
-      const t = tracers[tracerIdx];
-      tracerIdx = (tracerIdx + 1) % TRACER_POOL;
-      const pos = t.line.geometry.attributes.position.array;
-      pos[0] = ax; pos[1] = ay; pos[2] = az;
-      pos[3] = bx; pos[4] = by; pos[5] = bz;
-      t.line.geometry.attributes.position.needsUpdate = true;
-      t.line.material.color.setHex(color);
-      t.line.material.opacity = 0.95;
-      t.life = 0.25;
+    // A bright line from the muzzle to the hit point. `from`/`to` are
+    // THREE.Vector3s owned by the caller; the tracer copies their values.
+    tracer(from, to, color) {
+      const t = tracers[tracerNext];
+      tracerNext = (tracerNext + 1) % TRACER_COUNT;
+      const midX = (from.x + to.x) / 2;
+      const midY = (from.y + to.y) / 2;
+      const midZ = (from.z + to.z) / 2;
+      const dx = to.x - from.x;
+      const dy = to.y - from.y;
+      const dz = to.z - from.z;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (len < 0.01) return;
+      t.mesh.position.set(midX, midY, midZ);
+      t.mesh.lookAt(to.x, to.y, to.z);
+      t.mesh.scale.set(1, 1, len);
+      t.mesh.material.color.setHex(color);
+      t.mesh.material.opacity = 0.9;
+      t.mesh.visible = true;
+      t.life = 0.07;
     },
-    impact(x, y, z, color, count) {
-      const n = count || 5;
-      for (let i = 0; i < n; i++) {
-        const p = puffs[puffIdx];
-        puffIdx = (puffIdx + 1) % PUFF_POOL;
+    // A burst of 6 small debris cubes at a wall or body hit.
+    puff(x, y, z, color) {
+      for (let n = 0; n < 6; n++) {
+        const p = puffs[puffNext];
+        puffNext = (puffNext + 1) % PUFF_COUNT;
         p.mesh.position.set(x, y, z);
         p.mesh.material.color.setHex(color);
         p.mesh.material.opacity = 0.95;
         p.mesh.visible = true;
+        p.life = 0.45;
         const a = Math.random() * Math.PI * 2;
-        const s = 1 + Math.random() * 2.5;
-        p.vx = Math.cos(a) * s;
-        p.vy = 1 + Math.random() * 2;
-        p.vz = Math.sin(a) * s;
-        p.life = 0.35 + Math.random() * 0.2;
+        const b = Math.random() * Math.PI - Math.PI / 2;
+        const sp = 2 + Math.random() * 2.5;
+        p.vx = Math.cos(a) * Math.cos(b) * sp;
+        p.vy = Math.abs(Math.sin(b)) * sp + 1;
+        p.vz = Math.sin(a) * Math.cos(b) * sp;
       }
     },
     explosion(x, y, z) {
-      boom.position.set(x, y + 0.4, z);
-      boom.visible = true;
-      boom.scale.setScalar(0.3);
+      boom.position.set(x, y + 0.6, z);
+      boom.scale.setScalar(0.5);
       boom.material.opacity = 0.95;
-      boomLight.position.set(x, y + 1.2, z);
+      boom.visible = true;
+      boomLife = 0.6;
+      boomLight.position.set(x, y + 1.5, z);
       boomLight.intensity = 60;
-      boomLife = 0.55;
     },
-    muzzle(x, y, z, yaw, pitch) {
-      flash.position.set(x, y, z);
-      flash.rotation.set(pitch, yaw, Math.random() * Math.PI);
-      flash.visible = true;
-      flash.material.opacity = 0.95;
-      flashLife = 0.05;
-      tmpColor.setHex(0xffd27a);
+    muzzle(x, y, z) {
+      muzzleLight.position.set(x, y, z);
+      muzzleLight.intensity = 14;
     },
+    // Advance every pooled effect by dt seconds. Called once per frame.
     update(dt) {
-      for (const t of tracers) {
-        if (t.life <= 0) continue;
+      for (let i = 0; i < TRACER_COUNT; i++) {
+        const t = tracers[i];
+        if (!t.mesh.visible) continue;
         t.life -= dt;
-        if (t.life <= 0) t.line.material.opacity = 0;
-        else t.line.material.opacity = Math.min(0.95, t.life / 0.25);
+        t.mesh.material.opacity = Math.max(0, t.life / 0.07) * 0.9;
+        if (t.life <= 0) t.mesh.visible = false;
       }
-      for (const p of puffs) {
-        if (p.life <= 0) continue;
+      for (let i = 0; i < PUFF_COUNT; i++) {
+        const p = puffs[i];
+        if (!p.mesh.visible) continue;
         p.life -= dt;
-        if (p.life <= 0) {
-          p.mesh.visible = false;
-          continue;
-        }
         p.mesh.position.x += p.vx * dt;
         p.mesh.position.y += p.vy * dt;
         p.mesh.position.z += p.vz * dt;
         p.vy -= 6 * dt;
-        p.mesh.material.opacity = p.life * 2.2;
+        p.mesh.material.opacity = Math.max(0, p.life / 0.45);
+        if (p.life <= 0) p.mesh.visible = false;
       }
-      if (boomLife > 0) {
+      if (boom.visible) {
         boomLife -= dt;
-        const k = 1 - Math.max(0, boomLife) / 0.55;
-        boom.scale.setScalar(0.3 + k * 6.5);
-        boom.material.opacity = Math.max(0, 0.95 * (1 - k));
-        boomLight.intensity = Math.max(0, 60 * (1 - k));
+        boom.scale.addScalar(dt * 22);
+        boom.material.opacity = Math.max(0, boomLife / 0.6) * 0.95;
+        boomLight.intensity = Math.max(0, boomLife / 0.6) * 60;
         if (boomLife <= 0) {
           boom.visible = false;
           boomLight.intensity = 0;
         }
       }
-      if (flashLife > 0) {
-        flashLife -= dt;
-        if (flashLife <= 0) {
-          flash.visible = false;
-          flash.material.opacity = 0;
-        }
+      if (muzzleLight.intensity > 0) {
+        muzzleLight.intensity = Math.max(0, muzzleLight.intensity - dt * 160);
       }
     },
   };

@@ -1,343 +1,388 @@
-// bots.js — the AI opponents and teammates. Each bot is a small
-// state machine: walk a waypoint route to its objective, hold an
-// angle, and when it sees an enemy, stop, wait out a human-like
-// reaction delay, then fire in bursts with accuracy that falls off
-// with distance and target movement. Bots also hear gunfire, plant
-// and defuse the spike, and rotate between sites. All randomness
-// comes from the match RNG, so behaviour replays from the seed.
-
+// bots.js — the nine bots. Two teams, three roles each, one brain:
+//   rusher  — follows an attack route toward a site, waypoint by waypoint.
+//   holder  — walks to a hold spot near a site and watches an angle.
+//   carrier — the Vanguard bot carrying the charge: routes to the nearest
+//             site, plants, then defends the planted bomb.
+// Every bot sees through the same line-of-sight test as the bullets, hears
+// gunshots (noise events pull them to investigate), and shoots in bursts
+// with a reaction delay — they do not snap to the player. Bot brains think
+// at 10 Hz; steering and firing run in the 60 Hz fixed step.
 import * as THREE from 'three';
-import { BOT, MAP, PALETTE } from './config.js';
-import { createWeaponState, fireWeapon, updateWeapon } from './weapons.js';
+import { moveCircle, segmentBlocked, clampBounds, insideAny } from './collision.js';
+import { botShoot } from './combat.js';
+import { DEFUSE_SECONDS, PLANT_SECONDS } from './state.js';
 
-// Breadth-first search on the waypoint graph; returns an array of
-// waypoint indices from `from` to `to` (inclusive), or [].
-export function findPath(fromIdx, toIdx) {
-  if (fromIdx === toIdx) return [toIdx];
-  const prev = new Array(MAP.waypoints.length).fill(-1);
-  const queue = [fromIdx];
-  prev[fromIdx] = fromIdx;
-  while (queue.length) {
-    const cur = queue.shift();
-    for (const [a, b] of MAP.waypointEdges) {
-      const nxt = a === cur ? b : b === cur ? a : -1;
-      if (nxt < 0 || prev[nxt] !== -1) continue;
-      prev[nxt] = cur;
-      if (nxt === toIdx) {
-        const path = [toIdx];
-        let n = cur;
-        while (n !== fromIdx) {
-          path.unshift(n);
-          n = prev[n];
-        }
-        path.unshift(fromIdx);
-        return path;
-      }
-      queue.push(nxt);
-    }
-  }
-  return [toIdx];
-}
+const BOT_SPEED = 3.4;
+const BOT_RADIUS = 0.45;
+const THINK_EVERY = 6; // fixed steps between AI thinks (10 Hz)
+const SEE_DIST = 40;
+const HEAR_RADIUS = 26;
 
-export function nearestWaypoint(x, z) {
-  let best = 0;
-  let bestD = Infinity;
-  for (let i = 0; i < MAP.waypoints.length; i++) {
-    const w = MAP.waypoints[i];
-    const d = (w.x - x) * (w.x - x) + (w.z - z) * (w.z - z);
-    if (d < bestD) {
-      bestD = d;
-      best = i;
-    }
-  }
-  return best;
-}
+const VANGUARD_NAMES = ['Rook', 'Sable', 'Wren', 'Pike'];
+const JACKAL_NAMES = ['Havoc', 'Fang', 'Bramble', 'Onyx', 'Vex'];
 
-function botMaterials(team) {
-  const base = team === 'ct' ? PALETTE.ct : PALETTE.t;
-  return {
-    body: new THREE.MeshStandardMaterial({ color: base, roughness: 0.85 }),
-    dark: new THREE.MeshStandardMaterial({ color: 0x26262e, roughness: 0.7 }),
-    visor: new THREE.MeshStandardMaterial({ color: 0x11131a, roughness: 0.25, metalness: 0.6 }),
-  };
-}
+const VANGUARD_COLOR = 0x2f6fd0;
+const JACKAL_COLOR = 0xd0502a;
 
-export function createBot(id, name, team, spawn, role, scene) {
-  const mats = botMaterials(team);
+let nextId = 1;
+
+function buildBotMesh(scene, team) {
+  const color = team === 'vanguard' ? VANGUARD_COLOR : JACKAL_COLOR;
   const group = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.85, 0.32), mats.body);
-  body.position.y = 0.95;
-  body.castShadow = true;
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.21, 12, 10), mats.dark);
-  head.position.y = 1.55;
-  head.castShadow = true;
-  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.08, 0.05), mats.visor);
-  visor.position.set(0, 1.56, -0.18);
-  const gun = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.1, 0.62), mats.dark);
-  gun.position.set(0.2, 1.05, -0.3);
-  const pack = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.5, 0.14), mats.dark);
-  pack.position.set(0, 1.0, 0.22);
-  group.add(body, head, visor, gun, pack);
-  group.position.set(spawn.x, 0, spawn.z);
-  scene.add(group);
-  body.userData.botRef = null; // filled below
-  head.userData.botRef = null;
-
-  const bot = {
-    id,
-    name,
-    team,
-    role, // 'carrier' | 'support' | 'holder'
-    group,
-    body,
-    head,
-    pos: new THREE.Vector3(spawn.x, 0, spawn.z),
-    yaw: 0,
-    health: 100,
-    armor: 0,
-    alive: true,
-    weapon: createWeaponState(team === 't' ? 'rifle' : (id % 2 === 0 ? 'rifle' : 'smg')),
-    path: [],
-    pathIdx: 0,
-    holdUntil: 0,
-    targetSite: 'A',
-    state: 'route', // route | hold | engage | plant | defuse | dead
-    visibleEnemy: null,
-    reaction: 0,
-    burstLeft: 0,
-    burstPause: 0,
-    lastSeen: new THREE.Vector3(),
-    lastSeenAt: -99,
-    noise: null,
-    plantProgress: 0,
-    defuseProgress: 0,
-    speed: 0,
-    spawn: { x: spawn.x, z: spawn.z },
+  const torsoMat = new THREE.MeshStandardMaterial({ color, roughness: 0.8 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x23232a, roughness: 0.85 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: 0xc9a06b, roughness: 0.9 });
+  const geo = new THREE.BoxGeometry(1, 1, 1);
+  const add = (w, h, d, x, y, z, mat) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.scale.set(w, h, d);
+    m.position.set(x, y, z);
+    m.castShadow = true;
+    group.add(m);
+    return m;
   };
-  body.userData.botRef = bot;
-  head.userData.botRef = bot;
-  body.userData.part = 'body';
-  head.userData.part = 'head';
-  return bot;
+  add(0.5, 0.62, 0.3, 0, 1.06, 0, torsoMat); // torso
+  add(0.34, 0.3, 0.3, 0, 1.55, 0, skinMat); // head
+  add(0.36, 0.1, 0.32, 0, 1.72, 0, darkMat); // helmet
+  add(0.2, 0.62, 0.22, -0.14, 0.35, 0, darkMat); // left leg
+  add(0.2, 0.62, 0.22, 0.14, 0.35, 0, darkMat); // right leg
+  add(0.08, 0.08, 0.75, 0.2, 1.18, -0.28, darkMat); // rifle
+  scene.add(group);
+  return group;
 }
 
-function botEye(bot) {
-  return { x: bot.pos.x, y: 1.5, z: bot.pos.z };
+export function spawnBots(S, W) {
+  // Remove the previous round's meshes.
+  for (const bot of S.bots) {
+    if (bot.group) W.scene.remove(bot.group);
+  }
+  S.bots.length = 0;
+  nextId = 1;
+  const routes = W.routes;
+  const mk = (team, name, spawn, role, route) => {
+    const bot = {
+      id: 'bot' + nextId++,
+      team,
+      name,
+      role,
+      route: route.slice(),
+      routeKey: '',
+      wp: 0,
+      pos: { x: spawn[0], y: 0, z: spawn[1] },
+      yaw: team === 'vanguard' ? -Math.PI / 2 : Math.PI / 2,
+      hp: 100,
+      alive: true,
+      weapon: role === 'holder' ? 'lr50' : 'ar9',
+      speed: BOT_SPEED,
+      // AI state, all in simulation time.
+      target: null, // { kind: 'player' | 'bot', id } currently engaged
+      reactAt: 0, // when the bot may first fire at its target
+      burstLeft: 0,
+      nextBurstAt: 0,
+      nextShotAt: 0,
+      lastSeen: null, // { x, z, t } last known enemy position
+      investigate: null, // { x, z, t } noise to check out
+      holdSpot: null,
+      plantT: 0,
+      lastHitAt: -99,
+      lastHitFrom: null,
+      // Stuck recovery: if the bot barely moves for ~1.2 s while heading
+      // somewhere, it sidesteps around the obstacle instead of pushing
+      // the same wall forever.
+      stuckSteps: 0,
+      px: spawn[0],
+      pz: spawn[1],
+      detour: null,
+      detourT: 0,
+      group: null,
+    };
+    bot.group = buildBotMesh(W.scene, team);
+    bot.group.position.set(spawn[0], 0, spawn[1]);
+    S.bots.push(bot);
+    return bot;
+  };
+  // Vanguard: two rushers (mid, A), one rusher (B), one carrier (mid).
+  mk('vanguard', VANGUARD_NAMES[0], W.spawns.vanguard[1], 'rusher', routes.attackA);
+  mk('vanguard', VANGUARD_NAMES[1], W.spawns.vanguard[2], 'rusher', routes.attackB);
+  mk('vanguard', VANGUARD_NAMES[2], W.spawns.vanguard[3], 'rusher', routes.attackMid);
+  mk('vanguard', VANGUARD_NAMES[3], W.spawns.vanguard[4], 'carrier', routes.attackMid);
+  // Jackals: two holders at A, two at B, one mid holder.
+  const holdsA = routes.holdA;
+  const holdsB = routes.holdB;
+  const h1 = mk('jackals', JACKAL_NAMES[0], W.spawns.jackals[0], 'holder', []);
+  h1.holdSpot = { x: holdsA[0][0], z: holdsA[0][1] };
+  const h2 = mk('jackals', JACKAL_NAMES[1], W.spawns.jackals[1], 'holder', []);
+  h2.holdSpot = { x: holdsA[1][0], z: holdsA[1][1] };
+  const h3 = mk('jackals', JACKAL_NAMES[2], W.spawns.jackals[2], 'holder', []);
+  h3.holdSpot = { x: holdsB[0][0], z: holdsB[0][1] };
+  const h4 = mk('jackals', JACKAL_NAMES[3], W.spawns.jackals[3], 'holder', []);
+  h4.holdSpot = { x: holdsB[1][0], z: holdsB[1][1] };
+  const h5 = mk('jackals', JACKAL_NAMES[4], W.spawns.jackals[4], 'holder', []);
+  h5.holdSpot = { x: routes.holdMid[0][0], z: routes.holdMid[0][1] };
 }
 
-// Pick the nearest visible enemy for this bot. `enemies` is a list of
-// {pos, eyeY, alive, isPlayer, crouched, speed, ref}. Returns the
-// enemy or null.
-function perceive(bot, enemies, world) {
-  const eye = botEye(bot);
-  const fx = -Math.sin(bot.yaw);
-  const fz = -Math.cos(bot.yaw);
+// Can `bot` see the point (tx, ty, tz)? Distance, field of view and a real
+// line-of-sight test against the map. The player crouching behind a crate
+// is genuinely hidden.
+export function canSee(S, W, bot, tx, ty, tz) {
+  const dx = tx - bot.pos.x;
+  const dz = tz - bot.pos.z;
+  const dist = Math.hypot(dx, dz);
+  if (dist > SEE_DIST) return false;
+  // Field of view: 110 degrees around the bot's facing.
+  const facingX = -Math.sin(bot.yaw);
+  const facingZ = -Math.cos(bot.yaw);
+  const dot = (dx * facingX + dz * facingZ) / (dist || 1);
+  if (dot < 0.35) return false;
+  if (segmentBlocked(bot.pos.x, 1.45, bot.pos.z, tx, ty, tz, W.colliders)) return false;
+  return true;
+}
+
+// Find the nearest visible enemy for a bot. Enemies are the player and the
+// other team's bots; the player counts double when close, so bots do not
+// ignore the human while bot fights happen around them.
+function acquireTarget(S, W, bot) {
   let best = null;
-  let bestD = Infinity;
-  for (const e of enemies) {
-    if (!e.alive) continue;
-    const dx = e.pos.x - eye.x;
-    const dy = e.eyeY - eye.y;
-    const dz = e.pos.z - eye.z;
-    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (d > BOT.sightRange) continue;
-    const dot = (dx * fx + dz * fz) / Math.max(0.001, Math.hypot(dx, dz));
-    if (d > 7 && dot < BOT.fovCos) continue;
-    if (!world.lineOfSight(eye.x, eye.y, eye.z, e.pos.x, e.eyeY, e.pos.z)) continue;
-    if (d < bestD) {
-      bestD = d;
-      best = e;
+  let bestScore = Infinity;
+  // Only Jackals hunt the player: Vanguard bots are teammates and never
+  // treat the human as a target. (A friendly-fire bug lived here.)
+  if (bot.team === 'jackals' && S.player.alive) {
+    const p = S.player;
+    const eyeY = p.crouch ? 1.15 : 1.5;
+    if (canSee(S, W, bot, p.pos.x, eyeY, p.pos.z)) {
+      const d = Math.hypot(p.pos.x - bot.pos.x, p.pos.z - bot.pos.z);
+      best = { kind: 'player', x: p.pos.x, y: eyeY, z: p.pos.z, speed: Math.hypot(p.vel.x, p.vel.z) };
+      bestScore = d * 0.5; // the player is the priority target
+    }
+  }
+  for (const other of S.bots) {
+    if (!other.alive || other.team === bot.team) continue;
+    if (!canSee(S, W, bot, other.pos.x, 1.4, other.pos.z)) continue;
+    const d = Math.hypot(other.pos.x - bot.pos.x, other.pos.z - bot.pos.z);
+    if (d < bestScore) {
+      bestScore = d;
+      best = { kind: 'bot', id: other.id, x: other.pos.x, y: 1.4, z: other.pos.z, speed: other.speed };
     }
   }
   return best;
 }
 
-export function updateBot(bot, dt, ctx) {
-  const { world, rng, time, enemies, onShoot, onDamage, onPlant, onDefuse } = ctx;
-  if (!bot.alive) return;
-  updateWeapon(bot.weapon, dt);
-
-  const enemy = perceive(bot, enemies, world);
-  if (enemy) {
-    bot.lastSeen.set(enemy.pos.x, enemy.eyeY, enemy.pos.z);
-    bot.lastSeenAt = time;
-    if (bot.visibleEnemy !== enemy) {
-      bot.visibleEnemy = enemy;
-      bot.reaction = rng.range(BOT.reactionMin, BOT.reactionMax);
+// The 10 Hz think: pick a target, react to noise, choose a destination.
+function think(S, W, bot) {
+  if (S.bomb.state === 'planted' && bot.team === 'jackals') {
+    // The bomb is down: defenders abandon their holds and converge.
+    // (Set once — resetting the route every think would ping-pong the bot.)
+    if (bot.routeKey !== 'defuse') {
+      bot.routeKey = 'defuse';
+      bot.route = [[W.sites[S.bomb.site].x, W.sites[S.bomb.site].z]];
+      bot.wp = 0;
+      bot.role = 'rusher';
     }
-  } else if (bot.visibleEnemy && time - bot.lastSeenAt > 1.2) {
-    bot.visibleEnemy = null;
   }
-
-  // --- combat: after the reaction delay, fire in bursts.
-  if (bot.visibleEnemy && bot.reaction <= 0) {
-    const e = bot.visibleEnemy;
-    const dx = e.pos.x - bot.pos.x;
-    const dz = e.pos.z - bot.pos.z;
-    bot.yaw = Math.atan2(-dx, -dz);
-    const dist = Math.hypot(dx, dz);
-    if (bot.burstPause > 0) {
-      bot.burstPause -= dt;
-    } else if (bot.burstLeft <= 0) {
-      bot.burstLeft = rng.int(BOT.burstMin, BOT.burstMax);
-    } else if (bot.weapon.cooldown <= 0 && bot.weapon.mag > 0) {
-      const dir = new THREE.Vector3(e.pos.x - bot.pos.x, e.eyeY - 1.5, e.pos.z - bot.pos.z).normalize();
-      const shot = fireWeapon(bot.weapon, dir, 0, false, rng);
-      if (shot && !shot.dry) {
-        onShoot(bot, dir, shot);
-        bot.burstLeft -= 1;
-        if (bot.burstLeft <= 0) bot.burstPause = rng.range(BOT.burstPauseMin, BOT.burstPauseMax);
-        // Accuracy roll: base chance, worse far away, worse vs a
-        // moving or crouched target, better up close.
-        let p = BOT.accuracy * (10 / Math.max(6, dist));
-        if (e.speed > 2) p *= 0.75;
-        if (e.crouched) p *= 0.85;
-        p = Math.min(0.85, Math.max(0.05, p));
-        if (rng.chance(p)) {
-          const head = rng.chance(0.12);
-          const fall = dist > shot.def.falloffStart
-            ? Math.max(shot.def.falloffMin, 1 - (dist - shot.def.falloffStart) / 60)
-            : 1;
-          const dmg = shot.def.damage * (head ? shot.def.headMul : 1) * fall;
-          onDamage(e, dmg, head, bot);
-        }
-      }
+  if (S.bomb.carrier === bot.id && S.bomb.state === 'carried') {
+    bot.role = 'carrier';
+    // Route to the nearer site, again set once, not every think.
+    const dA = Math.hypot(W.sites.A.x - bot.pos.x, W.sites.A.z - bot.pos.z);
+    const dB = Math.hypot(W.sites.B.x - bot.pos.x, W.sites.B.z - bot.pos.z);
+    const east = bot.pos.x > 0;
+    const key = (east ? 'carryE' : 'carryW') + (dA < dB ? 'A' : 'B');
+    if (bot.routeKey !== key) {
+      bot.routeKey = key;
+      // East of the mid wall the bot takes the gap route around the lane
+      // divider (x = 16 clears both dividers); west of it, the full
+      // attack route from spawn is the right way in.
+      bot.route = east
+        ? dA < dB
+          ? [[16, -9], [16, -15], [20, -15]]
+          : [[16, 9], [16, 15], [20, 15]]
+        : dA < dB
+          ? W.routes.attackA
+          : W.routes.attackB;
+      bot.wp = 0;
     }
-    if (bot.weapon.mag === 0) {
-      bot.weapon.reloading = bot.weapon.def.reload;
-      bot.weapon.mag = 0;
-    }
-    bot.state = 'engage';
-    bot.group.position.set(bot.pos.x, 0, bot.pos.z);
-    bot.group.rotation.y = bot.yaw;
-    return;
   }
-  if (bot.reaction > 0) bot.reaction -= dt;
-
-  // --- objective: plant / defuse when on site and undisturbed.
-  if (ctx.phase === 'live' && bot.visibleEnemy === null) {
-    if (bot.team === 't' && bot.role === 'carrier' && !ctx.planted && !ctx.spikePlanted) {
-      const site = MAP.sites[bot.targetSite];
-      const d = Math.hypot(bot.pos.x - site.x, bot.pos.z - site.z);
-      if (d < site.r - 0.5) {
-        bot.state = 'plant';
-        bot.plantProgress += dt;
-        if (bot.plantProgress >= 3.0) {
-          bot.plantProgress = 0;
-          onPlant(bot, bot.targetSite);
-        }
-        return;
-      }
-    }
-    if (bot.team === 'ct' && ctx.spikePlanted) {
-      const site = MAP.sites[ctx.plantedSite];
-      const d = Math.hypot(bot.pos.x - site.x, bot.pos.z - site.z);
-      if (d < site.r - 0.5) {
-        bot.state = 'defuse';
-        bot.defuseProgress += dt;
-        if (bot.defuseProgress >= 5.0) {
-          bot.defuseProgress = 0;
-          onDefuse(bot);
-        }
-        return;
+  const target = acquireTarget(S, W, bot);
+  if (target) {
+    if (!bot.target) bot.reactAt = S.time + 0.45 + Math.random() * 0.45;
+    bot.target = target;
+    bot.lastSeen = { x: target.x, z: target.z, t: S.time };
+  } else if (bot.target) {
+    // Lost sight: keep the last known position for a few seconds.
+    bot.target = null;
+  }
+  // Hearing: a recent gunshot within earshot pulls the bot to look.
+  if (!bot.target) {
+    for (let i = S.noise.length - 1; i >= 0; i--) {
+      const n = S.noise[i];
+      if (S.time - n.t > 3) continue;
+      const d = Math.hypot(n.x - bot.pos.x, n.z - bot.pos.z);
+      if (d < HEAR_RADIUS) {
+        bot.investigate = { x: n.x, z: n.z, t: S.time };
+        break;
       }
     }
   }
-  bot.plantProgress = 0;
-  bot.defuseProgress = 0;
-
-  // --- movement: follow the waypoint path; hold at the destination.
-  if (bot.state === 'hold' && time < bot.holdUntil) {
-    bot.speed = 0;
-    bot.group.rotation.y = bot.yaw;
-    return;
-  }
-  if (!bot.path.length || bot.pathIdx >= bot.path.length) {
-    // Choose a destination: attackers push their site, defenders
-    // rotate between sites or answer noise / the planted spike.
-    let goal;
-    if (ctx.spikePlanted && bot.team === 'ct') goal = MAP.sites[ctx.plantedSite];
-    else if (bot.noise && time - bot.noise.at < 4) goal = { x: bot.noise.x, z: bot.noise.z };
-    else if (bot.team === 't') goal = MAP.sites[bot.targetSite];
-    else goal = MAP.sites[bot.targetSite];
-    const from = nearestWaypoint(bot.pos.x, bot.pos.z);
-    const to = nearestWaypoint(goal.x, goal.z);
-    const idxPath = findPath(from, to);
-    bot.path = idxPath.map((i) => MAP.waypoints[i]);
-    bot.path.push({ x: goal.x, z: goal.z });
-    bot.pathIdx = 0;
-    bot.state = 'route';
-  }
-  const target = bot.path[bot.pathIdx];
-  const dx = target.x - bot.pos.x;
-  const dz = target.z - bot.pos.z;
-  const dist = Math.hypot(dx, dz);
-  if (dist < 0.5) {
-    bot.pathIdx += 1;
-    if (bot.pathIdx >= bot.path.length) {
-      bot.state = 'hold';
-      bot.holdUntil = time + rng.range(2.5, 6);
-      bot.yaw = rng.range(0, Math.PI * 2);
-      if (bot.team === 'ct') bot.targetSite = bot.targetSite === 'A' ? 'B' : 'A';
-    }
-    return;
-  }
-  const speed = bot.team === 't' ? BOT.runSpeed : BOT.walkSpeed;
-  bot.yaw = Math.atan2(-dx, -dz);
-  bot.pos.x += (dx / dist) * speed * dt;
-  bot.pos.z += (dz / dist) * speed * dt;
-  const p = { x: bot.pos.x, z: bot.pos.z };
-  world.resolveCircle(p, 0.38);
-  bot.pos.x = p.x;
-  bot.pos.z = p.z;
-  bot.speed = speed;
-  bot.group.position.set(bot.pos.x, 0, bot.pos.z);
-  bot.group.rotation.y = bot.yaw;
-  // Walk bob.
-  bot.group.children[0].position.y = 0.95 + Math.abs(Math.sin(time * 9 + bot.id)) * 0.03;
+  if (bot.investigate && S.time - bot.investigate.t > 6) bot.investigate = null;
 }
 
-export function damageBot(bot, amount) {
-  if (!bot.alive) return false;
-  let remaining = amount;
-  if (bot.armor > 0) {
-    const absorbed = Math.min(bot.armor, amount * 0.5);
-    bot.armor -= absorbed;
-    remaining = amount - absorbed;
-  }
-  bot.health -= remaining;
-  if (bot.health <= 0) {
-    bot.health = 0;
-    bot.alive = false;
-    bot.state = 'dead';
-    bot.group.rotation.x = -Math.PI / 2;
-    bot.group.position.y = 0.25;
-    return true;
-  }
+// Steer toward (x, z) at bot speed; returns true on arrival.
+function steer(S, W, bot, x, z, dt) {
+  const dx = x - bot.pos.x;
+  const dz = z - bot.pos.z;
+  const d = Math.hypot(dx, dz);
+  if (d < 0.6) return true;
+  const vx = (dx / d) * bot.speed;
+  const vz = (dz / d) * bot.speed;
+  moveCircle(bot.pos, BOT_RADIUS, vx * dt, vz * dt, W.colliders);
+  clampBounds(bot.pos, BOT_RADIUS, W.bounds);
+  bot.yaw = Math.atan2(-vx, -vz);
   return false;
 }
 
-export function resetBot(bot, spawn, rng) {
-  bot.pos.set(spawn.x, 0, spawn.z);
-  bot.group.position.set(spawn.x, 0, spawn.z);
-  bot.group.rotation.set(0, 0, 0);
-  bot.health = 100;
-  bot.armor = 0;
-  bot.alive = true;
-  bot.state = 'route';
-  bot.path = [];
-  bot.pathIdx = 0;
-  bot.visibleEnemy = null;
-  bot.reaction = 0;
-  bot.burstLeft = 0;
-  bot.burstPause = 0;
-  bot.plantProgress = 0;
-  bot.defuseProgress = 0;
-  bot.noise = null;
-  bot.targetSite = rng.chance(0.5) ? 'A' : 'B';
-  bot.weapon.mag = bot.weapon.def.mag;
-  bot.weapon.reserve = bot.weapon.def.reserve;
-  bot.weapon.reloading = 0;
-  bot.weapon.cooldown = 0;
-  bot.yaw = spawn.x < 0 ? -Math.PI / 2 : Math.PI / 2;
+// One fixed step for every bot. `stepIndex` counts fixed steps so the
+// 10 Hz think runs every sixth step.
+export function stepBots(S, W, dt, stepIndex) {
+  for (const bot of S.bots) {
+    if (!bot.alive) continue;
+    if (stepIndex % THINK_EVERY === 0) think(S, W, bot);
+
+    // --- planting / defusing ------------------------------------------
+    if (bot.role === 'carrier' && S.bomb.state === 'carried' && S.bomb.carrier === bot.id) {
+      const site = nearestSite(S, W, bot.pos.x, bot.pos.z);
+      if (site && Math.abs(bot.pos.x - site.x) < 3.5 && Math.abs(bot.pos.z - site.z) < 3.5) {
+        bot.plantT += dt;
+        if (bot.plantT >= PLANT_SECONDS) {
+          bot.plantT = 0;
+          W.plantBomb(site.key);
+        }
+        syncMesh(bot);
+        continue;
+      }
+    }
+    if (S.bomb.state === 'planted' && bot.team === 'jackals') {
+      const s = W.sites[S.bomb.site];
+      if (Math.abs(bot.pos.x - s.x) < 3 && Math.abs(bot.pos.z - s.z) < 3) {
+        S.bomb.defuseT += dt;
+        S.bomb.defuser = bot.name;
+        if (S.bomb.defuseT >= DEFUSE_SECONDS) W.defuseBomb();
+        syncMesh(bot);
+        continue;
+      }
+    }
+
+    // --- combat --------------------------------------------------------
+    if (bot.target && S.time >= bot.reactAt) {
+      const t = bot.target;
+      // Face the target and fire in bursts of 3-5 with pauses.
+      bot.yaw = Math.atan2(-(t.x - bot.pos.x), -(t.z - bot.pos.z));
+      if (bot.burstLeft <= 0 && S.time >= bot.nextBurstAt) {
+        bot.burstLeft = 3 + Math.floor(Math.random() * 3);
+        bot.nextShotAt = S.time;
+      }
+      if (bot.burstLeft > 0 && S.time >= bot.nextShotAt) {
+        bot.burstLeft -= 1;
+        bot.nextShotAt = S.time + 0.13;
+        if (bot.burstLeft === 0) bot.nextBurstAt = S.time + 0.7 + Math.random() * 0.7;
+        const isPlayer = t.kind === 'player';
+        const speed = isPlayer
+          ? Math.hypot(S.player.vel.x, S.player.vel.z)
+          : BOT_SPEED;
+        // Re-acquire the target's live position each shot.
+        if (isPlayer && S.player.alive) {
+          botShoot(S, W, bot, S.player.pos.x, S.player.crouch ? 1.15 : 1.5, S.player.pos.z, true, speed);
+        } else if (!isPlayer) {
+          const tb = S.bots.find((b) => b.id === t.id);
+          if (tb && tb.alive) botShoot(S, W, bot, tb.pos.x, 1.4, tb.pos.z, false, speed);
+          else bot.target = null;
+        }
+      }
+      // Hold ground while fighting; strafe a little to stay unpredictable.
+      if (Math.random() < 0.3) {
+        const side = Math.random() < 0.5 ? 1 : -1;
+        moveCircle(bot.pos, BOT_RADIUS, Math.cos(bot.yaw) * side * 0.4 * dt * 10, -Math.sin(bot.yaw) * side * 0.4 * dt * 10, W.colliders);
+        clampBounds(bot.pos, BOT_RADIUS, W.bounds);
+      }
+      syncMesh(bot);
+      continue;
+    }
+
+    // --- movement ------------------------------------------------------
+    let dest = null;
+    if (bot.role === 'holder' && bot.holdSpot) {
+      dest = bot.holdSpot;
+    } else if (bot.investigate) {
+      dest = bot.investigate;
+    } else if (bot.route.length > 0) {
+      dest = { x: bot.route[bot.wp][0], z: bot.route[bot.wp][1] };
+      if (Math.hypot(dest.x - bot.pos.x, dest.z - bot.pos.z) < 1.2) {
+        bot.wp = Math.min(bot.wp + 1, bot.route.length - 1);
+        dest = { x: bot.route[bot.wp][0], z: bot.route[bot.wp][1] };
+      }
+    }
+    if (dest) {
+      // Stuck detection: near-zero displacement while a destination exists.
+      const moved = Math.hypot(bot.pos.x - bot.px, bot.pos.z - bot.pz);
+      bot.px = bot.pos.x;
+      bot.pz = bot.pos.z;
+      if (moved < 0.02) bot.stuckSteps += 1;
+      else bot.stuckSteps = 0;
+      if (bot.stuckSteps > 70 && !bot.detour) {
+        // Sidestep perpendicular to the blocked heading, alternating side.
+        // The detour point is kept inside the yard and out of walls, so a
+        // stuck bot can never detour itself out of the map.
+        const dx = dest.x - bot.pos.x;
+        const dz = dest.z - bot.pos.z;
+        const d = Math.hypot(dx, dz) || 1;
+        const side = bot.id.charCodeAt(3) % 2 === 0 ? 1 : -1;
+        const mkDetour = (s) => ({
+          x: bot.pos.x + (-dz / d) * 3 * s,
+          z: bot.pos.z + (dx / d) * 3 * s,
+        });
+        let det = mkDetour(side);
+        clampBounds(det, 0.5, W.bounds);
+        if (insideAny(det.x, det.z, 0.5, W.colliders)) {
+          det = mkDetour(-side);
+          clampBounds(det, 0.5, W.bounds);
+        }
+        bot.detour = det;
+        bot.detourT = 2.5;
+        bot.stuckSteps = 0;
+      }
+      if (bot.detour) {
+        bot.detourT -= dt;
+        const done = steer(S, W, bot, bot.detour.x, bot.detour.z, dt);
+        if (done || bot.detourT <= 0) bot.detour = null;
+        syncMesh(bot);
+        continue;
+      }
+      const arrived = steer(S, W, bot, dest.x, dest.z, dt);
+      if (arrived && bot.investigate) bot.investigate = null;
+      if (arrived && bot.role === 'holder') {
+        // Holders watch an angle: slowly scan left and right.
+        bot.yaw += Math.sin(S.time * 0.5 + bot.id.charCodeAt(3)) * 0.01;
+      }
+    }
+    syncMesh(bot);
+  }
+}
+
+function nearestSite(S, W, x, z) {
+  let best = null;
+  let bestD = Infinity;
+  for (const key of ['A', 'B']) {
+    const s = W.sites[key];
+    const d = Math.hypot(s.x - x, s.z - z);
+    if (d < bestD) {
+      bestD = d;
+      best = { key, x: s.x, z: s.z };
+    }
+  }
+  return bestD < 4 ? best : null;
+}
+
+// Keep the visible mesh on the simulated position. One write per bot.
+function syncMesh(bot) {
+  if (!bot.group) return;
+  bot.group.position.set(bot.pos.x, 0, bot.pos.z);
+  bot.group.rotation.y = bot.yaw;
 }

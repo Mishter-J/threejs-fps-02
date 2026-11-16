@@ -1,190 +1,78 @@
-// main.js — bootstrap and the render loop. It owns the renderer,
-// the camera and the frame loop; the simulation (sim.js) owns the
-// game. The loop is the only place rendering and simulation meet:
-// fixed-step sim updates, then camera + viewmodel + HUD sync.
-// Staging: ?shot=menu|action|won puts the game in a deterministic
-// state for screenshots, no pointer lock or input needed, and sets
-// window.__shotReady when the frame is rendered.
-
+// main.js — wiring and the game loop. The simulation runs on a fixed step
+// (1/60 s) fed by an accumulator over real elapsed time, so timers, bot
+// brains and bullet flight run at true speed even when rendering is slow;
+// rendering simply draws the latest simulated state once per frame. The
+// loop never allocates in the hot path: the renderer, camera and world
+// objects are built once here and handed to the modules as one context.
 import * as THREE from 'three';
-import { SEED } from './config.js';
-import { buildWorld } from './world.js';
+import { createState } from './state.js';
+import { buildMap } from './map.js';
 import { createEffects } from './effects.js';
-import { createAudio } from './audio.js';
-import { createInput } from './input.js';
+import { createPlayerController } from './player.js';
+import { spawnBots, stepBots } from './bots.js';
+import { createRoundController } from './round.js';
+import { updateProjectiles } from './combat.js';
 import { createHud } from './hud.js';
-import { createSim } from './sim.js';
 
-const params = new URLSearchParams(window.location.search);
-const shotMode = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') || '', 10);
-const seed = Number.isFinite(seedParam) ? seedParam : SEED;
+const SIM_DT = 1 / 60;
+const MAX_FRAME_DT = 0.5; // clamp: a hitch never fast-forwards the sim
+const MAX_STEPS_PER_FRAME = 40; // 40 steps cover a 0.5 s frame at 60 Hz
 
-const canvas = document.getElementById('game-canvas');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+const canvas = document.createElement('canvas');
+canvas.id = 'game';
+document.body.appendChild(canvas);
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.shadowMap.enabled = false;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x2a1e33);
-const camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.08, 300);
+const camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.1, 300);
 camera.rotation.order = 'YXZ';
 scene.add(camera);
-// A small light riding with the camera: keeps the viewmodel and the
-// ground right in front of the player readable at dusk.
-const camLight = new THREE.PointLight(0xffd9a0, 2.2, 7, 1.4);
-camera.add(camLight);
 
-const world = buildWorld(scene);
+const S = createState();
+const map = buildMap(scene);
 const effects = createEffects(scene);
-const audio = createAudio();
-const hud = createHud();
-const input = createInput(canvas);
-const sim = createSim({ scene, world, effects, audio, camera, hud });
-const state = sim.state;
-const player = sim.player;
 
-let sensitivity = 1.0;
-let framesRendered = 0;
-let lastTime = performance.now();
+// The world context: everything the simulation modules need, in one place.
+const W = {
+  scene,
+  camera,
+  canvas,
+  colliders: map.colliders,
+  sites: map.sites,
+  routes: map.routes,
+  spawns: map.spawns,
+  bounds: map.bounds,
+  bombMesh: map.bombMesh,
+  effects,
+  spawnBots: () => spawnBots(S, W),
+  plantBomb: (site) => round.plantBomb(site),
+  defuseBomb: () => round.defuseBomb(),
+  transferBomb: (deadBot) => round.transferBomb(deadBot),
+  onHitmarker: (head, kill) => hud.showHitmarker(head, kill),
+  onPlayerHurt: () => hud.hurtFlash(),
+  onShake: (mag) => {
+    shake = Math.max(shake, mag);
+  },
+  round: null,
+};
+const round = createRoundController(S, W);
+W.round = round;
 
-// Menu overview camera: slow orbit over the yard while the menu is up.
-const menuCam = { angle: 0.6, radius: 26, height: 16 };
+const player = createPlayerController(S, W, camera);
+const hud = createHud(S, W);
+player.bindInput(canvas, hud);
+player.buildViewmodel();
 
-function syncCamera() {
-  const shake = state.shake;
-  const shX = shake > 0 ? (Math.random() - 0.5) * shake * 0.06 : 0;
-  const shY = shake > 0 ? (Math.random() - 0.5) * shake * 0.06 : 0;
-  if (state.phase === 'menu') {
-    // Staged screenshots freeze the orbit so the frame is identical
-    // every run; live play drifts the camera slowly instead.
-    const a = shotMode ? 0.6 : (menuCam.angle += 0.00045, menuCam.angle);
-    camera.position.set(
-      Math.sin(a) * menuCam.radius,
-      menuCam.height,
-      Math.cos(a) * menuCam.radius,
-    );
-    camera.lookAt(0, 0.5, 0);
-    return;
-  }
-  camera.position.set(player.pos.x + shX, player.eyeHeight + shY, player.pos.z);
-  camera.rotation.y = player.yaw;
-  camera.rotation.x = player.pitch;
-  camera.rotation.z = 0;
-}
+// A debug handle for play-testing: read-only state, no cheats.
+window.SANDLINE = { state: S, version: '3.0' };
 
-function frame(now) {
-  requestAnimationFrame(frame);
-  const dt = Math.min(0.1, (now - lastTime) / 1000);
-  lastTime = now;
-
-  const look = input.consumeLook();
-  const stepInput = {
-    move: input.moveState(),
-    look,
-    firing: input.firing,
-    reload: input.wasPressed('KeyR'),
-    grenade: input.wasPressed('KeyG'),
-    use: keysHeldE(),
-    sensitivity,
-  };
-  // Buy keys and toggles (edge-triggered).
-  if (input.wasPressed('KeyB')) {
-    if (state.phase === 'buy') {
-      hud.hideBuy();
-      state.buyTimer = Math.min(state.buyTimer, 0.5);
-    }
-  }
-  if (input.wasPressed('Digit1')) sim.buy('smg');
-  if (input.wasPressed('Digit2')) sim.buy('rifle');
-  if (input.wasPressed('Digit3')) sim.buy('sniper');
-  if (input.wasPressed('Digit4')) sim.buy('grenade');
-  if (input.wasPressed('Digit5')) sim.buy('armor');
-  if (input.wasPressed('KeyM')) {
-    audio.setMuted(!audio.isMuted());
-    hud.setHint(audio.isMuted() ? 'Sound muted (M to unmute)' : '');
-  }
-
-  // In staged screenshot mode the simulation never advances, so the
-  // captured frame is exactly the staged state on every run. The HUD
-  // still redraws (with dt 0) so the minimap and banners are painted.
-  const frozen = !!shotMode;
-  if (!frozen) {
-    sim.update(dt, stepInput);
-    effects.update(dt);
-  }
-  syncCamera();
-  const moving = !frozen && player.speed > 0.5 && state.phase !== 'menu';
-  sim.viewmodel.update(frozen ? 0 : dt, moving, state.weapon.reloading, frozen ? false : input.firing);
-  if (state.phase !== 'menu') hud.update(state, frozen ? 0 : dt);
-  renderer.render(scene, camera);
-  framesRendered += 1;
-  if (shotMode && framesRendered >= 10) window.__shotReady = true;
-  if (!shotMode && framesRendered === 5) window.__gameReady = true;
-}
-
-const eKey = new Set();
-function keysHeldE() {
-  return eKey.has('KeyE');
-}
-window.addEventListener('keydown', (e) => {
-  if (e.code === 'KeyE') eKey.add('KeyE');
-});
-window.addEventListener('keyup', (e) => {
-  if (e.code === 'KeyE') eKey.delete('KeyE');
-});
-
-// ---- menu wiring
-const startBtn = document.getElementById('start-btn');
-const restartBtn = document.getElementById('restart-btn');
-const resumeBtn = document.getElementById('resume-btn');
-const sensSlider = document.getElementById('sens-slider');
-const muteBtn = document.getElementById('mute-btn');
-
-function startGame() {
-  audio.unlock();
-  audio.click();
-  hud.hideMenu();
-  input.requestLock();
-  sim.startMatch(seed);
-  hud.setHint('WASD move · Mouse aim · Click fire · R reload · G frag · E defuse · B buy · M mute');
-}
-
-startBtn.addEventListener('click', startGame);
-restartBtn.addEventListener('click', () => {
-  audio.click();
-  hud.hideEnd();
-  input.requestLock();
-  sim.startMatch(seed);
-});
-resumeBtn.addEventListener('click', () => {
-  hud.showPause(false);
-  input.requestLock();
-});
-sensSlider.addEventListener('input', () => {
-  sensitivity = Number.parseFloat(sensSlider.value) || 1;
-});
-muteBtn.addEventListener('click', () => {
-  audio.setMuted(!audio.isMuted());
-  muteBtn.textContent = audio.isMuted() ? 'SOUND: OFF' : 'SOUND: ON';
-});
-
-// Clicking the canvas during play re-locks the pointer.
-canvas.addEventListener('click', () => {
-  if (state.phase !== 'menu' && !input.locked) input.requestLock();
-});
-
-// Losing pointer lock mid-round pauses; Esc in the menu does nothing.
-document.addEventListener('pointerlockchange', () => {
-  if (!input.locked && state.phase === 'live' && player.alive && !shotMode) {
-    hud.showPause(true);
-  } else if (input.locked) {
-    hud.showPause(false);
-  }
-});
+let shake = 0;
+let stepIndex = 0;
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -192,21 +80,42 @@ window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// ---- boot
-if (shotMode) {
-  // Deterministic staged screenshot: no menu, no pointer lock.
-  hud.hideMenu();
-  document.getElementById('menu-screen').classList.add('hidden');
-  if (shotMode === 'menu') {
-    sim.stage('menu');
-    hud.showMenu();
-  } else {
-    sim.stage(shotMode);
-  }
-} else {
-  hud.showMenu();
-  sim.stage('menu');
+// One fixed simulation step. Order matters: the round clock first (it can
+// end the round), then the player, the bots, then the grenades.
+function step(dt) {
+  S.time += dt;
+  if (S.bannerT > 0) S.bannerT -= dt;
+  round.step(dt);
+  player.step(dt, W);
+  stepBots(S, W, dt, stepIndex);
+  updateProjectiles(S, W, dt);
+  stepIndex += 1;
 }
 
-window.__fps = { sim, state, player, hud, input, audio, world, effects };
+let last = performance.now();
+let acc = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const frameDt = Math.min((now - last) / 1000, MAX_FRAME_DT);
+  last = now;
+  acc += frameDt;
+  let n = 0;
+  while (acc >= SIM_DT && n < MAX_STEPS_PER_FRAME) {
+    step(SIM_DT);
+    acc -= SIM_DT;
+    n += 1;
+  }
+  if (n === MAX_STEPS_PER_FRAME) acc = 0; // spiral guard: drop time instead of stuttering
+  player.updateCamera(camera);
+  if (shake > 0) {
+    camera.position.x += (Math.random() - 0.5) * shake * 0.12;
+    camera.position.y += (Math.random() - 0.5) * shake * 0.12;
+    shake = Math.max(0, shake - frameDt * 1.8);
+  }
+  effects.update(frameDt);
+  hud.update(now);
+  renderer.render(scene, camera);
+}
+
 requestAnimationFrame(frame);
