@@ -3,94 +3,101 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EMBER YARD — Tactical FPS</title>
-<link rel="icon" href="./favicon.png">
-<link rel="stylesheet" href="./src/style.css">
+<title>Sandline Protocol — Tactical FPS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f6b'/%3E%3Ctext x='16' y='23' font-size='18' font-family='sans-serif' font-weight='bold' fill='%23fff8e8' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E">
 <script type="importmap">
-{
-  "imports": {
-    "three": "./vendor/three/three.module.min.js"
-  }
-}
+{ "imports": { "three": "./vendor/three/three.module.min.js" } }
 </script>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #141210;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #fff8e8; }
+  #game { display: block; width: 100vw; height: 100vh; }
+  .hud { position: fixed; inset: 0; pointer-events: none; }
+  .pill { background: rgba(20, 18, 16, 0.72); border-radius: 6px; padding: 6px 12px;
+    font-weight: 700; font-size: 14px; letter-spacing: 0.06em; }
+  .topbar { position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; }
+  .topbar .timer { color: #ffd27a; }
+  .topbar .timer.urgent { color: #ff5a3c; }
+  .topbar .money { color: #7be495; }
+  .teams { position: absolute; top: 56px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; }
+  .teams .bomb { color: #ffd27a; }
+  .teams .bomb.danger { color: #ff5a3c; }
+  .mapwrap { position: absolute; top: 12px; right: 12px; border: 2px solid rgba(255, 248, 232, 0.5);
+    border-radius: 8px; overflow: hidden; background: #141210; }
+  .feed { position: absolute; top: 168px; right: 12px; text-align: right; font-size: 13px;
+    font-weight: 600; line-height: 1.6; color: #ffe9a8; white-space: pre-line;
+    text-shadow: 0 1px 2px #000; }
+  .cross { position: absolute; left: 50%; top: 50%; width: 0; height: 0; }
+  .cdot { position: absolute; width: 3px; height: 3px; background: #fff8e8; border-radius: 50%;
+    transform: translate(-50%, -50%); }
+  .cline { position: absolute; background: #fff8e8; box-shadow: 0 0 2px #000; }
+  .cline.c0, .cline.c1 { width: 2px; height: 9px; left: 0; top: 0; }
+  .cline.c2, .cline.c3 { width: 9px; height: 2px; left: 0; top: 0; }
+  .hitmark { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%);
+    font-size: 22px; font-weight: 900; color: #fff; opacity: 0; text-shadow: 0 0 6px #000; }
+  .hitmark.head { color: #ffd27a; }
+  .hitmark.kill { color: #ff5a3c; font-size: 26px; }
+  .banner { position: absolute; top: 22%; left: 50%; transform: translateX(-50%);
+    font-size: 26px; font-weight: 800; letter-spacing: 0.05em; text-align: center;
+    text-shadow: 0 2px 8px #000; transition: opacity 0.3s; white-space: nowrap; }
+  .plantwrap { position: absolute; top: 30%; left: 50%; transform: translateX(-50%);
+    width: 260px; display: none; text-align: center; }
+  .plantlabel { font-weight: 800; letter-spacing: 0.15em; margin-bottom: 6px;
+    text-shadow: 0 1px 4px #000; }
+  .plantbar { height: 10px; background: rgba(0, 0, 0, 0.6); border-radius: 5px; overflow: hidden; }
+  .plantfill { height: 100%; width: 0; background: #1f8a7a; }
+  .prompt { position: absolute; top: 58%; left: 50%; transform: translateX(-50%);
+    font-weight: 700; text-shadow: 0 1px 4px #000; display: none; }
+  .vignette { position: absolute; inset: 0; opacity: 0; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(255, 30, 10, 0.55) 100%); }
+  .dirhit { position: absolute; left: 50%; top: 50%; width: 260px; height: 260px; opacity: 0;
+    pointer-events: none; border-radius: 50%;
+    background: conic-gradient(from 0deg, rgba(255, 40, 10, 0.8) 0deg, transparent 70deg, transparent 360deg); }
+  .hpwrap { position: absolute; left: 16px; bottom: 16px; background: rgba(20, 18, 16, 0.72);
+    border-radius: 8px; padding: 10px 14px; min-width: 170px; }
+  .hpnum { font-size: 34px; font-weight: 900; display: inline; }
+  .hplabel { font-size: 14px; font-weight: 700; margin-left: 6px; color: #c9b18a; }
+  .hpbar { height: 8px; background: rgba(255, 255, 255, 0.15); border-radius: 4px;
+    margin-top: 6px; overflow: hidden; }
+  .hpfill { height: 100%; width: 100%; background: #7be495; }
+  .hpfill.low { background: #ff5a3c; }
+  .ammowrap { position: absolute; right: 16px; bottom: 16px; background: rgba(20, 18, 16, 0.72);
+    border-radius: 8px; padding: 10px 14px; text-align: right; min-width: 150px; }
+  .ammoname { font-size: 13px; font-weight: 700; color: #ffd27a; }
+  .ammonum { font-size: 34px; font-weight: 900; }
+  .ammonum small { font-size: 18px; color: #c9b18a; }
+  .keys { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: rgba(255, 248, 232, 0.75); text-shadow: 0 1px 2px #000; }
+  .buy { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: rgba(20, 18, 16, 0.88); border-radius: 10px; padding: 20px 26px;
+    width: 460px; pointer-events: auto; }
+  .buytitle { font-size: 18px; font-weight: 900; letter-spacing: 0.15em; }
+  .buymoney { color: #7be495; font-weight: 800; margin: 4px 0; }
+  .buyhint { font-size: 13px; color: #c9b18a; margin: 6px 0; }
+  .buyrow { display: flex; gap: 12px; padding: 9px 10px; border-radius: 6px; cursor: pointer; }
+  .buyrow:hover { background: rgba(255, 210, 122, 0.15); }
+  .buyname { font-weight: 800; width: 170px; }
+  .buydesc { color: #c9b18a; flex: 1; }
+  .buyprice { color: #7be495; font-weight: 800; }
+  .buymsg { margin-top: 8px; font-weight: 700; color: #ffd27a; min-height: 18px; }
+  .overlay { position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; background: rgba(20, 16, 10, 0.45); pointer-events: auto; }
+  .card { background: rgba(20, 18, 16, 0.88); border-radius: 12px; padding: 28px 36px;
+    max-width: 560px; text-align: center; }
+  .card h1 { margin: 0 0 4px; font-size: 34px; letter-spacing: 0.08em; }
+  .card .subtitle { color: #ffd27a; font-weight: 700; margin-bottom: 14px; }
+  .card p { line-height: 1.55; color: #efe3c8; }
+  .bigbtn { pointer-events: auto; background: #1f8a7a; color: #fff; border: none;
+    font-size: 20px; font-weight: 900; letter-spacing: 0.15em; padding: 14px 44px;
+    border-radius: 8px; cursor: pointer; margin: 10px 0; }
+  .bigbtn:hover { background: #27a894; }
+  .controls { margin-top: 12px; font-size: 13px; color: #c9b18a; white-space: pre-line; }
+  .hidden { display: none !important; }
+</style>
 </head>
 <body>
-<canvas id="game-canvas"></canvas>
-
-<div id="hud" class="hidden">
-  <div id="damage-vignette"></div>
-  <div id="crosshair"><span class="ch-dot"></span><span class="ch-t"></span><span class="ch-b"></span><span class="ch-l"></span><span class="ch-r"></span></div>
-  <div id="hitmarker"></div>
-
-  <div id="top-bar">
-    <div id="score-box"><span id="score-ct">0</span><span class="score-sep">—</span><span id="score-t">0</span></div>
-    <div id="round-num">ROUND 1</div>
-    <div id="timer">1:40</div>
-  </div>
-  <div id="objective">ELIMINATE VIPER OR STOP THE SPIKE</div>
-
-  <canvas id="minimap" width="168" height="138"></canvas>
-  <div id="killfeed"></div>
-
-  <div id="bottom-left">
-    <div id="health-row"><span id="health-num">100</span><span class="hp-label">HP</span><span id="armor-num"></span></div>
-    <div id="health-bar"><div id="health-fill"></div></div>
-    <div id="money">$800</div>
-  </div>
-  <div id="bottom-right">
-    <div id="weapon-name">P-9 SIDEARM</div>
-    <div id="ammo-row"><span id="ammo-mag">12</span><span class="ammo-sep">/</span><span id="ammo-reserve">36</span></div>
-    <div id="grenades">FRAG x0</div>
-  </div>
-
-  <div id="progress-wrap" class="hidden"><div id="progress-label">DEFUSING…</div><div id="progress-bar"><div id="progress-fill"></div></div></div>
-  <div id="hint"></div>
-
-  <div id="banner" class="hidden"><div id="banner-title"></div><div id="banner-sub"></div></div>
-
-  <div id="buy-menu" class="hidden">
-    <div class="buy-title">BUY PHASE <span id="buy-money">$800</span></div>
-    <div id="buy-rows"></div>
-    <div class="buy-foot">Click an item or press 1–5 · B to close early</div>
-  </div>
-</div>
-
-<div id="menu-screen">
-  <div class="menu-inner">
-    <div class="menu-kicker">THREE.JS TACTICAL FPS</div>
-    <h1>EMBER YARD</h1>
-    <p class="menu-sub">Round-based squad shooter. You are EMBER — hold the yard, stop the spike, out-aim VIPER.</p>
-    <div class="menu-rules">
-      <div><b>OBJECTIVE</b> — VIPER plants the spike at SITE A or B. Eliminate them, or defuse the spike (hold E on site).</div>
-      <div><b>ROUNDS</b> — First squad to 5 rounds takes the match. Win rounds to earn cash, buy better guns between rounds.</div>
-      <div><b>GUNPLAY</b> — Standing still and crouching tighten your spread. Headshots deal double. Spraying on the move will miss.</div>
-      <div><b>CONTROLS</b> — WASD move · Mouse aim · Click fire · R reload · G frag grenade · C / Ctrl crouch · B buy · M mute</div>
-    </div>
-    <button id="start-btn">DEPLOY ▸</button>
-    <div class="menu-foot">
-      <label>Sensitivity <input id="sens-slider" type="range" min="0.4" max="2.5" step="0.1" value="1"></label>
-      <button id="mute-btn" class="small-btn">SOUND: ON</button>
-    </div>
-    <p class="menu-note">Best in desktop Chrome · No downloads, no accounts, no network — everything runs locally.</p>
-  </div>
-</div>
-
-<div id="end-screen" class="hidden">
-  <div class="menu-inner">
-    <h1 id="end-title">MATCH WON</h1>
-    <p id="end-sub" class="menu-sub"></p>
-    <button id="restart-btn">PLAY AGAIN ▸</button>
-  </div>
-</div>
-
-<div id="pause-screen" class="hidden">
-  <div class="menu-inner">
-    <h1>PAUSED</h1>
-    <p class="menu-sub">Pointer unlocked. Click resume to jump back in.</p>
-    <button id="resume-btn">RESUME ▸</button>
-  </div>
-</div>
-
 <script type="module" src="./src/main.js"></script>
 </body>
 </html>
